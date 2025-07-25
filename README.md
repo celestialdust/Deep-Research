@@ -1,15 +1,10 @@
 # Deep Research
 
-Deep research has broken out as one of the most popular agent applications. This is a simple, configurable, fully open source deep research agent that works across many model providers, search tools, and MCP servers. 
-
-* Read more in our [blog](https://blog.langchain.com/open-deep-research/) 
-* See our [video](https://www.youtube.com/watch?v=agGiWUpxkhg) for a quick overview
-
 ### 🚀 Quickstart
 
 1. Clone the repository and activate a virtual environment:
 ```bash
-git clone https://github.com/langchain-ai/open_deep_research.git
+git clone <the repo url>
 cd open_deep_research
 uv venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
@@ -55,15 +50,4 @@ Deep Research offers extensive configuration options to customize the research p
 - **Search API** (default: Tavily): Choose from Tavily (works with all models), OpenAI Native Web Search, Anthropic Native Web Search, or None
 - **Max Researcher Iterations** (default: 3): Number of times the Research Supervisor will reflect on research and ask follow-up questions
 - **Max React Tool Calls** (default: 5): Maximum number of tool calling iterations in a single researcher step
-
-**Important Model Requirements:**
-
-1. **Structured Outputs**: All models must support structured outputs. Check support [here](https://python.langchain.com/docs/integrations/chat/).
-
-2. **Search API Compatibility**: Research and Compression models must support your selected search API:
-   - Anthropic search requires Anthropic models with web search capability
-   - OpenAI search requires OpenAI models with web search capability  
-   - Tavily works with all models
-
-3. **Tool Calling**: All models must support tool calling functionality
 
