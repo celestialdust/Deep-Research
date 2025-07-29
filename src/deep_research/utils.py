@@ -14,10 +14,9 @@ from tavily import AsyncTavilyClient
 from langgraph.config import get_store
 from mcp import McpError
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from deep_research.state import Summary, ResearchComplete
-from deep_research.configuration import SearchAPI, Configuration
-from deep_research.prompts import summarize_webpage_prompt
-from deep_research.configuration import Configuration
+from .state import Summary, ResearchComplete
+from .configuration import SearchAPI, Configuration
+from .prompts import summarize_webpage_prompt
 
 ##########################
 # Tavily Search Tool Utils
@@ -501,7 +500,7 @@ def get_tavily_api_key(config: RunnableConfig):
 
 def build_model_config(model_name: str, max_tokens: int, config: RunnableConfig, tags: List[str] = None):
     """Build model configuration with Azure OpenAI parameters when needed."""
-    from deep_research.configuration import Configuration
+    from .configuration import Configuration
     
     configurable = Configuration.from_runnable_config(config)
     base_config = {

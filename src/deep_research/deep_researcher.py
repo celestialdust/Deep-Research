@@ -5,10 +5,10 @@ from langgraph.graph import START, END, StateGraph
 from langgraph.types import Command
 import asyncio
 from typing import Literal
-from deep_research.configuration import (
+from .configuration import (
     Configuration, 
 )
-from deep_research.state import (
+from .state import (
     AgentState,
     AgentInputState,
     SupervisorState,
@@ -19,7 +19,7 @@ from deep_research.state import (
     ResearchComplete,
     ResearcherOutputState
 )
-from deep_research.prompts import (
+from .prompts import (
     clarify_with_user_instructions,
     transform_messages_into_research_topic_prompt,
     research_system_prompt,
@@ -28,7 +28,7 @@ from deep_research.prompts import (
     final_report_generation_prompt,
     lead_researcher_prompt
 )
-from deep_research.utils import (
+from .utils import (
     get_today_str,
     is_token_limit_exceeded,
     get_model_token_limit,
@@ -368,4 +368,4 @@ deep_researcher_builder.add_edge(START, "clarify_with_user")
 deep_researcher_builder.add_edge("research_supervisor", "final_report_generation")
 deep_researcher_builder.add_edge("final_report_generation", END)
 
-deep_researcher = deep_researcher_builder.compile()
+graph = deep_researcher_builder.compile(name = "deep_researcher")
