@@ -2,7 +2,7 @@ from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage, get_buffer_string, filter_messages
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import START, END, StateGraph
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 import asyncio
 from typing import Literal
 from .configuration import (
@@ -42,7 +42,8 @@ from .utils import (
     get_notes_from_tool_calls,
     build_model_config,
     think_tool,
-    refine_draft_report
+    refine_draft_report,
+    tavily_search
 )
 
 # Initialize a configurable model that we will use throughout the agent
@@ -69,7 +70,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         return Command(goto="write_research_brief", update={"messages": [AIMessage(content=response.verification)]})
 
 
-async def write_research_brief(state: AgentState, config: RunnableConfig)-> Command[Literal["write_draft_report"]]:
+async def write_research_brief(state: AgentState, config: RunnableConfig)-> Command[Literal["approve_research_brief"]]:
     configurable = Configuration.from_runnable_config(config)
     research_model_config = build_model_config(
         configurable.research_model,
@@ -77,17 +78,127 @@ async def write_research_brief(state: AgentState, config: RunnableConfig)-> Comm
         config,
         ["langsmith:nostream"]
     )
-    research_model = configurable_model.with_structured_output(ResearchQuestion).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(research_model_config)
-    response = await research_model.ainvoke([HumanMessage(content=transform_messages_into_research_topic_prompt.format(
-        messages=get_buffer_string(state.get("messages", [])),
-        date=get_today_str()
-    ))])
+    
+    # Check if search is enabled for brief generation
+    if configurable.enable_search_for_brief:
+        # Use tool-calling model with Tavily search (max 1 search allowed)
+        research_model_with_tools = configurable_model.bind_tools([tavily_search]).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(research_model_config)
+        
+        # Initial call - may include tool calls
+        initial_messages = [HumanMessage(content=transform_messages_into_research_topic_prompt.format(
+            messages=get_buffer_string(state.get("messages", [])),
+            date=get_today_str()
+        ))]
+        initial_response = await research_model_with_tools.ainvoke(initial_messages)
+        
+        # If there are tool calls, execute them (max 1 iteration)
+        if initial_response.tool_calls:
+            tool_call = initial_response.tool_calls[0]  # Only execute first tool call
+            tool_result = await tavily_search.ainvoke(tool_call["args"], config)
+            
+            # Add tool message and get structured output
+            messages_with_tool = initial_messages + [
+                initial_response,
+                ToolMessage(content=tool_result, name=tool_call["name"], tool_call_id=tool_call["id"])
+            ]
+            
+            # Now get structured output
+            research_model_structured = configurable_model.with_structured_output(ResearchQuestion).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(research_model_config)
+            response = await research_model_structured.ainvoke(messages_with_tool)
+        else:
+            # No tool calls, get structured output directly
+            research_model_structured = configurable_model.with_structured_output(ResearchQuestion).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(research_model_config)
+            response = await research_model_structured.ainvoke(initial_messages)
+    else:
+        # No search - use structured output directly
+        research_model = configurable_model.with_structured_output(ResearchQuestion).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(research_model_config)
+        response = await research_model.ainvoke([HumanMessage(content=transform_messages_into_research_topic_prompt.format(
+            messages=get_buffer_string(state.get("messages", [])),
+            date=get_today_str()
+        ))])
+    
     return Command(
-        goto="write_draft_report", 
+        goto="approve_research_brief", 
         update={
             "research_brief": response.research_brief
         }
     )
+
+
+async def approve_research_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "write_draft_report"]]:
+    """
+    Human-in-the-Loop checkpoint for research brief approval.
+    
+    This node pauses execution and waits for human approval or rejection of the research brief.
+    Based on LangGraph interrupt patterns from documentation.
+    
+    Decision format (resume value):
+        {"type": "approve"} - Continue to write_draft_report
+        {"type": "reject", "feedback": "..."} - Loop back to write_research_brief
+    
+    If HITL is disabled, proceeds directly to write_draft_report.
+    
+    Args:
+        state: Current agent state containing research_brief
+        config: Runnable configuration
+        
+    Returns:
+        Command to route to either write_draft_report (approved) or write_research_brief (rejected)
+    """
+    configurable = Configuration.from_runnable_config(config)
+    
+    # If HITL is disabled, proceed directly to draft report
+    if not configurable.enable_human_in_the_loop:
+        return Command(goto="write_draft_report")
+    
+    # Get current refinement round and research brief
+    brief_refinement_rounds = state.get("brief_refinement_rounds", 0)
+    research_brief = state.get("research_brief")
+    
+    if not research_brief:
+        return Command(goto="write_draft_report")
+    
+    # Prepare interrupt payload following LangGraph HITL patterns
+    interrupt_payload = {
+        "research_brief": research_brief,
+        "refinement_round": brief_refinement_rounds,
+        "max_rounds": configurable.max_brief_refinement_rounds,
+        "instructions": "Review the research brief. Respond with: {\"type\": \"approve\"} or {\"type\": \"reject\", \"feedback\": \"your feedback here\"}"
+    }
+    
+    # Call interrupt() - this pauses execution and returns the resume value
+    decision = interrupt(interrupt_payload)
+    
+    # Process the decision
+    # Expected format: {"type": "approve"} or {"type": "reject", "feedback": "..."}
+    if not isinstance(decision, dict):
+        return Command(goto="write_draft_report")
+    
+    decision_type = decision.get("type")
+    
+    if decision_type == "approve":
+        # Approved - proceed to write_draft_report
+        return Command(goto="write_draft_report")
+        
+    elif decision_type == "reject":
+        # Rejected - check if we can refine again
+        feedback = decision.get("feedback", "Please revise the research brief to better address the requirements.")
+        
+        if brief_refinement_rounds >= configurable.max_brief_refinement_rounds:
+            # Max rounds reached - proceed anyway
+            return Command(goto="write_draft_report")
+        else:
+            # Loop back to write_research_brief with feedback
+            return Command(
+                goto="write_research_brief",
+                update={
+                    "messages": [HumanMessage(content=f"The research brief was rejected. Please revise based on this feedback:\n\n{feedback}")],
+                    "brief_refinement_rounds": brief_refinement_rounds + 1
+                }
+            )
+    else:
+        # Unknown decision type - treat as approval for safety
+        return Command(goto="write_draft_report")
 
 
 async def write_draft_report(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor"]]:
@@ -110,11 +221,45 @@ async def write_draft_report(state: AgentState, config: RunnableConfig) -> Comma
         config,
         ["langsmith:nostream"]
     )
-    draft_model = configurable_model.with_structured_output(DraftReport).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(draft_model_config)
-    response = await draft_model.ainvoke([HumanMessage(content=draft_report_generation_prompt.format(
-        research_brief=state.get("research_brief", ""),
-        date=get_today_str()
-    ))])
+    
+    # Check if search is enabled for draft generation
+    if configurable.enable_search_for_draft:
+        # Use tool-calling model with Tavily search (max 1 search allowed)
+        draft_model_with_tools = configurable_model.bind_tools([tavily_search]).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(draft_model_config)
+        
+        # Initial call - may include tool calls
+        initial_messages = [HumanMessage(content=draft_report_generation_prompt.format(
+            research_brief=state.get("research_brief", ""),
+            date=get_today_str()
+        ))]
+        initial_response = await draft_model_with_tools.ainvoke(initial_messages)
+        
+        # If there are tool calls, execute them (max 1 iteration)
+        if initial_response.tool_calls:
+            tool_call = initial_response.tool_calls[0]  # Only execute first tool call
+            tool_result = await tavily_search.ainvoke(tool_call["args"], config)
+            
+            # Add tool message and get structured output
+            messages_with_tool = initial_messages + [
+                initial_response,
+                ToolMessage(content=tool_result, name=tool_call["name"], tool_call_id=tool_call["id"])
+            ]
+            
+            # Now get structured output
+            draft_model_structured = configurable_model.with_structured_output(DraftReport).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(draft_model_config)
+            response = await draft_model_structured.ainvoke(messages_with_tool)
+        else:
+            # No tool calls, get structured output directly
+            draft_model_structured = configurable_model.with_structured_output(DraftReport).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(draft_model_config)
+            response = await draft_model_structured.ainvoke(initial_messages)
+    else:
+        # No search - use structured output directly
+        draft_model = configurable_model.with_structured_output(DraftReport).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(draft_model_config)
+        response = await draft_model.ainvoke([HumanMessage(content=draft_report_generation_prompt.format(
+            research_brief=state.get("research_brief", ""),
+            date=get_today_str()
+        ))])
+    
     return Command(
         goto="research_supervisor",
         update={
@@ -455,12 +600,11 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
 deep_researcher_builder = StateGraph(AgentState, input=AgentInputState, config_schema=Configuration)
 deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)
 deep_researcher_builder.add_node("write_research_brief", write_research_brief)
+deep_researcher_builder.add_node("approve_research_brief", approve_research_brief)
 deep_researcher_builder.add_node("write_draft_report", write_draft_report)
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)
 deep_researcher_builder.add_edge(START, "clarify_with_user")
-deep_researcher_builder.add_edge("write_research_brief", "write_draft_report")
-deep_researcher_builder.add_edge("write_draft_report", "research_supervisor")
 deep_researcher_builder.add_edge("research_supervisor", "final_report_generation")
 deep_researcher_builder.add_edge("final_report_generation", END)
 

@@ -55,6 +55,15 @@ Today's date is {date}.
 
 You will return a single research question that will be used to guide the research.
 
+<Optional Search Tool>
+You may have access to web search tools. If search is enabled, you can conduct ONE search to gather up-to-date information before creating the research brief. Use this to:
+- Verify current facts, dates, or recent developments
+- Understand rapidly evolving topics
+- Gather context about emerging trends or breaking news
+
+If you choose to search, keep the query focused and relevant to the user's request. The search should enhance your ability to create a well-informed research brief.
+</Optional Search Tool>
+
 Guidelines:
 1. Maximize Specificity and Detail
 - Include all known user preferences and explicitly list key attributes or dimensions to consider.
@@ -362,6 +371,15 @@ For example, if the user's messages are in English, then MAKE SURE you write you
 This is critical. The user will only understand the answer if it is written in the same language as their input message.
 
 Today's date is {date}.
+
+<Optional Search Tool>
+You may have access to web search tools. If search is enabled, you can conduct ONE search to gather up-to-date context before creating the draft report. Use this to:
+- Verify current facts, dates, or recent developments related to the research brief
+- Understand rapidly evolving topics
+- Gather preliminary context about the subject matter
+
+If you choose to search, keep the query focused and relevant to the research brief. The search should enhance your ability to create a well-informed initial draft.
+</Optional Search Tool>
 
 Please create a detailed answer to the overall research brief that:
 1. Is well-organized with proper headings (# for title, ## for sections, ### for subsections)

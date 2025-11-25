@@ -409,6 +409,7 @@ MODEL_TOKEN_LIMITS = {
     "openai:o1-pro": 200000,
     "azure_openai:o4-mini": 200000,
     "azure_openai:o3": 200000,
+    "azure_openai:gpt-5": 200000,
     "anthropic:claude-opus-4": 200000,
     "anthropic:claude-sonnet-4": 200000,
     "anthropic:claude-3-7-sonnet": 200000,
@@ -525,6 +526,9 @@ def build_model_config(model_name: str, max_tokens: int, config: RunnableConfig,
             base_config["azure_deployment"] = configurable.azure_o4_mini_deployment
         elif "o3" in actual_model:
             base_config["azure_deployment"] = configurable.azure_o3_deployment
+        elif "gpt-5" in actual_model:
+            base_config["azure_deployment"] = configurable.azure_gpt5_deployment
+            base_config["api_version"] = configurable.gpt5_api_version
     else:
         base_config["model"] = model_name
     

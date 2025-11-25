@@ -64,6 +64,28 @@ class Configuration(BaseModel):
             }
         }
     )
+    enable_human_in_the_loop: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Whether to enable human-in-the-loop approval for the research brief before proceeding to draft report generation"
+            }
+        }
+    )
+    max_brief_refinement_rounds: int = Field(
+        default=1,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 1,
+                "min": 1,
+                "max": 10,
+                "description": "Maximum number of times the research brief can be refined based on human feedback"
+            }
+        }
+    )
     # Research Configuration
     search_api: SearchAPI = Field(
         default=SearchAPI.TAVILY,
@@ -104,6 +126,26 @@ class Configuration(BaseModel):
                 "max": 30,
                 "step": 1,
                 "description": "Maximum number of tool calling iterations to make in a single researcher step."
+            }
+        }
+    )
+    enable_search_for_brief: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Whether to enable Tavily search for the research brief generation node (max 1 search allowed)"
+            }
+        }
+    )
+    enable_search_for_draft: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Whether to enable Tavily search for the draft report generation node (max 1 search allowed)"
             }
         }
     )
@@ -149,10 +191,30 @@ class Configuration(BaseModel):
             }
         }
     )
+    gpt5_api_version: str = Field(
+        default="2025-04-01-preview",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "2025-04-01-preview",
+                "description": "Azure OpenAI API version for GPT-5 model"
+            }
+        }
+    )
+    azure_gpt5_deployment: str = Field(
+        default="gsds-gpt-5",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "gsds-gpt-5",
+                "description": "Azure deployment name for GPT-5 model"
+            }
+        }
+    )
     
     # Model Configuration
     summarization_model: str = Field(
-        default="azure_openai:o3",
+        default="azure_openai:gpt-5",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
@@ -172,7 +234,7 @@ class Configuration(BaseModel):
         }
     )
     research_model: str = Field(
-        default="azure_openai:o3",
+        default="azure_openai:gpt-5",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
@@ -212,7 +274,7 @@ class Configuration(BaseModel):
         }
     )
     final_report_model: str = Field(
-        default="azure_openai:o3",
+        default="azure_openai:gpt-5",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
