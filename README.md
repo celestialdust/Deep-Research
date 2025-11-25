@@ -44,19 +44,36 @@ Deep Research offers extensive configuration options to customize the research p
 - **Max Structured Output Retries** (default: 3): Maximum number of retries for structured output calls from models when parsing fails
 - **Allow Clarification** (default: true): Whether to allow the researcher to ask clarifying questions before starting research
 - **Max Concurrent Research Units** (default: 5): Maximum number of research units to run concurrently using sub-agents. Higher values enable faster research but may hit rate limits
+- **Enable Human-in-the-Loop** (default: true): Whether to enable human approval for the research brief before proceeding to draft report generation
+- **Max Brief Refinement Rounds** (default: 1): Maximum number of times the research brief can be refined based on human feedback before proceeding automatically
 
 #### Research Configuration
 
 - **Search API** (default: Tavily): Choose from Tavily (works with all models), OpenAI Native Web Search, Anthropic Native Web Search, or None
 - **Max Researcher Iterations** (default: 3): Number of times the Research Supervisor will reflect on research and ask follow-up questions
 - **Max React Tool Calls** (default: 5): Maximum number of tool calling iterations in a single researcher step
+- **Enable Search for Brief** (default: true): Whether to enable Tavily search for the research brief generation node (max 1 search allowed)
+- **Enable Search for Draft** (default: true): Whether to enable Tavily search for the draft report generation node (max 1 search allowed)
+
+#### Model Configuration
+
+- **Supported Models**: GPT-5, O3, O4-mini and other Azure OpenAI models
+- **GPT-5 Configuration**: 
+  - Deployment name: `gsds-gpt-5` (default)
+  - API Version: `2025-04-01-preview`
+  - Token limit: 200,000 tokens
+- **Model Selection**: Configure different models for summarization, research, compression, and final report generation
+- **Azure OpenAI Settings**: Customize endpoint, API version, and deployment names for each model
 
 ## Architecture Overview
 
 Deep Research Agent uses a sophisticated multi-agent architecture built on LangGraph with the following components:
 
+- **User Clarification**: Optionally asks clarifying questions before starting research
+- **Research Brief Generator**: Creates a detailed research brief from user messages, with optional Tavily search for up-to-date context
+- **Human-in-the-Loop Approval**: Allows human review and refinement of the research brief before proceeding (optional, configurable)
+- **Draft Report Generator**: Creates an initial draft report from the research brief that serves as a baseline for iterative refinement, with optional Tavily search for preliminary context
 - **Research Supervisor**: Orchestrates the research process using a diffusion algorithm, breaks down complex queries, and manages parallel research units with strategic reflection via `think_tool`
-- **Draft Report Generator**: Creates an initial draft report from the research brief that serves as a baseline for iterative refinement
 - **Research Agents**: Conduct focused research on specific topics using available tools and search APIs
 - **Compression Agent**: Synthesizes and compresses research findings from multiple agents
 - **Draft Report Refiner**: Iteratively refines the draft report based on new research findings using the diffusion algorithm
@@ -65,7 +82,10 @@ Deep Research Agent uses a sophisticated multi-agent architecture built on LangG
 ### Key Features
 
 - **Diffusion Algorithm**: Iterative denoising approach where research progressively refines an initial draft by identifying gaps, conducting targeted research, and updating the report
+- **Human-in-the-Loop**: Optional human approval workflow for research briefs with configurable refinement rounds
+- **Contextual Search**: Optional Tavily search integration for research brief and draft report generation to ensure up-to-date information
 - **Strategic Reflection**: `think_tool` enables the supervisor to pause and reflect on research progress before making decisions
+- **Multi-Model Support**: Support for GPT-5, O3, O4-mini and other Azure OpenAI models with flexible configuration
 - **Multi-Language Support**: Automatically detects and responds in the same language as the user's input
 - **Enhanced Quality Criteria**: Final reports follow strict insightfulness (granular breakdowns, detailed tables, nuanced discussion) and helpfulness (satisfying intent, clarity, accuracy) rules
 
@@ -98,12 +118,20 @@ deep_research_openai/
 
 #### `src/deep_research/`
 
-- **`configuration.py`**: Defines the `Configuration` class with all configurable parameters including model settings, search APIs, MCP configuration, and Azure OpenAI settings. Supports both environment variables and UI configuration.
+- **`configuration.py`**: Defines the `Configuration` class with all configurable parameters including:
+  - Model settings (GPT-5, O3, O4-mini support)
+  - Search APIs (Tavily, OpenAI, Anthropic)
+  - Human-in-the-loop configuration
+  - Search enablement for brief and draft nodes
+  - MCP configuration
+  - Azure OpenAI settings with separate deployment configurations
+  - Supports both environment variables and UI configuration
 
 - **`deep_researcher.py`**: Contains the main LangGraph workflow implementation with nodes for:
   - User clarification
-  - Research brief generation
-  - Draft report generation
+  - Research brief generation (with optional Tavily search)
+  - Human-in-the-loop research brief approval
+  - Draft report generation (with optional Tavily search)
   - Research supervisor (with diffusion algorithm)
   - Parallel research execution
   - Research compression
@@ -111,7 +139,7 @@ deep_research_openai/
   - Final report generation
 
 - **`state.py`**: Defines all state classes and data models:
-  - `AgentState`: Main workflow state (includes `draft_report` field)
+  - `AgentState`: Main workflow state (includes `draft_report` and `brief_refinement_rounds` fields)
   - `SupervisorState`: Research supervisor state (includes `draft_report` field)
   - `ResearcherState`: Individual researcher state
   - `DraftReport`: Structured output for draft report generation
@@ -120,15 +148,17 @@ deep_research_openai/
 - **`utils.py`**: Utility functions including:
   - `think_tool`: Strategic reflection tool for research planning
   - `refine_draft_report`: Tool for iteratively refining the draft report
+  - `tavily_search`: Tavily search tool for research brief and draft generation
   - MCP tool loading and authentication
   - Search API integration (Tavily, OpenAI, Anthropic)
-  - Model configuration builders
-  - Token limit management
+  - Model configuration builders with GPT-5 support
+  - Token limit management with extended model coverage
 
 - **`prompts.py`**: System prompts and templates for:
   - Research clarification
+  - Research brief generation (with optional search tool instructions)
   - Research planning with diffusion algorithm
-  - Draft report generation
+  - Draft report generation (with optional search tool instructions)
   - Research execution with strategic reflection
   - Content summarization and compression (with research topic context)
   - Draft report refinement
