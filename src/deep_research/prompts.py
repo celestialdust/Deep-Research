@@ -56,7 +56,7 @@ Today's date is {date}.
 You will return a single research question that will be used to guide the research.
 
 <Optional Search Tool>
-You may have access to web search tools. If search is enabled, you can conduct ONE search to gather up-to-date information before creating the research brief. Use this to:
+You may have access to web search tools. If search is enabled, you have to conduct ONE search to gather up-to-date information before creating the research brief. Use this to:
 - Verify current facts, dates, or recent developments
 - Understand rapidly evolving topics
 - Gather context about emerging trends or breaking news
@@ -373,7 +373,7 @@ This is critical. The user will only understand the answer if it is written in t
 Today's date is {date}.
 
 <Optional Search Tool>
-You may have access to web search tools. If search is enabled, you can conduct ONE search to gather up-to-date context before creating the draft report. Use this to:
+You may have access to web search tools. If search is enabled, you have to conduct ONE search to gather up-to-date context before creating the draft report. Use this to:
 - Verify current facts, dates, or recent developments related to the research brief
 - Understand rapidly evolving topics
 - Gather preliminary context about the subject matter
@@ -529,6 +529,12 @@ Format the report in clear markdown with proper structure and include source ref
 
 summarize_webpage_prompt = """You are tasked with summarizing the raw content of a webpage retrieved from a web search. Your goal is to create a summary that preserves the most important information from the original web page. This summary will be used by a downstream research agent, so it's crucial to maintain the key details without losing essential information.
 
+Here is the URL of the webpage:
+
+<webpage_url>
+{url}
+</webpage_url>
+
 Here is the raw content of the webpage:
 
 <webpage_content>
@@ -558,6 +564,7 @@ Present your summary in the following format:
 
 ```
 {{
+   "url": "The URL of the webpage provided above",
    "summary": "Your summary here, structured with appropriate paragraphs or bullet points as needed",
    "key_excerpts": "First important quote or excerpt, Second important quote or excerpt, Third important quote or excerpt, ...Add more excerpts as needed, up to a maximum of 5"
 }}
@@ -568,6 +575,7 @@ Here are two examples of good summaries:
 Example 1 (for a news article):
 ```json
 {{
+   "url": "https://www.nasa.gov/artemis-ii-launch",
    "summary": "On July 15, 2023, NASA successfully launched the Artemis II mission from Kennedy Space Center. This marks the first crewed mission to the Moon since Apollo 17 in 1972. The four-person crew, led by Commander Jane Smith, will orbit the Moon for 10 days before returning to Earth. This mission is a crucial step in NASA's plans to establish a permanent human presence on the Moon by 2030.",
    "key_excerpts": "Artemis II represents a new era in space exploration, said NASA Administrator John Doe. The mission will test critical systems for future long-duration stays on the Moon, explained Lead Engineer Sarah Johnson. We're not just going back to the Moon, we're going forward to the Moon, Commander Jane Smith stated during the pre-launch press conference."
 }}
@@ -576,6 +584,7 @@ Example 1 (for a news article):
 Example 2 (for a scientific article):
 ```json
 {{
+   "url": "https://www.nature.com/articles/climate-change-2023",
    "summary": "A new study published in Nature Climate Change reveals that global sea levels are rising faster than previously thought. Researchers analyzed satellite data from 1993 to 2022 and found that the rate of sea-level rise has accelerated by 0.08 mm/year² over the past three decades. This acceleration is primarily attributed to melting ice sheets in Greenland and Antarctica. The study projects that if current trends continue, global sea levels could rise by up to 2 meters by 2100, posing significant risks to coastal communities worldwide.",
    "key_excerpts": "Our findings indicate a clear acceleration in sea-level rise, which has significant implications for coastal planning and adaptation strategies, lead author Dr. Emily Brown stated. The rate of ice sheet melt in Greenland and Antarctica has tripled since the 1990s, the study reports. Without immediate and substantial reductions in greenhouse gas emissions, we are looking at potentially catastrophic sea-level rise by the end of this century, warned co-author Professor Michael Green."  
 }}
@@ -585,3 +594,35 @@ Remember, your goal is to create a summary that can be easily understood and uti
 
 Today's date is {date}.
 """
+
+
+##########################
+# Context Summarization Prompt
+##########################
+context_summarization_prompt = """<role>
+Context Extraction Assistant
+</role>
+
+<primary_objective>
+Your sole objective in this task is to extract the highest quality/most relevant context from the conversation history below.
+</primary_objective>
+
+<objective_information>
+You're nearing the total number of input tokens you can accept, so you must extract the highest quality/most relevant pieces of information from your conversation history.
+This context will then overwrite the conversation history presented below. Because of this, ensure the context you extract is only the most important information to your overall goal.
+</objective_information>
+
+<instructions>
+The conversation history below will be replaced with the context you extract in this step. Because of this, you must do your very best to extract and record all of the most important context from the conversation history.
+You want to ensure that you don't repeat any actions you've already completed, so the context you extract from the conversation history should be focused on the most important information to your overall goal.
+</instructions>
+
+The user will message you with the full message history you'll be extracting context from, to then replace. Carefully read over it all, and think deeply about what information is most important to your overall goal that should be saved:
+
+With all of this in mind, please carefully read over the entire conversation history, and extract the most important and relevant context to replace it so that you can free up space in the conversation history.
+Respond ONLY with the extracted context. Do not include any additional information, or text before or after the extracted context.
+
+<messages>
+Messages to summarize:
+{messages}
+</messages>"""
