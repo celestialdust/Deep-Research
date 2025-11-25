@@ -96,7 +96,7 @@ Deep Research Agent uses a sophisticated multi-agent architecture built on LangG
 - **Multi-Language Support**: Automatically detects and responds in the same language as the user's input
 - **Enhanced Quality Criteria**: Final reports follow strict insightfulness (granular breakdowns, detailed tables, nuanced discussion) and helpfulness (satisfying intent, clarity, accuracy) rules
 - **Context Engineering**: Automatic context window summarization using o4-mini when approaching token limits, mirroring LangChain v1's `SummarizationMiddleware`
-- **Research Validation**: Notes and raw notes are asynchronously saved to `/docs` before final report generation for resource validation (non-blocking I/O)
+- **Research Validation**: Notes and raw notes (with source URLs) are asynchronously saved to `/docs` before final report generation for resource validation and traceability (non-blocking I/O)
 
 ## Project Structure
 
@@ -155,6 +155,7 @@ deep_research_openai/
   - `SupervisorState`: Research supervisor state (includes `draft_report` field)
   - `ResearcherState`: Individual researcher state
   - `DraftReport`: Structured output for draft report generation
+  - `Summary`: Structured output for webpage summarization (includes `url`, `summary`, and `key_excerpts` fields)
   - Structured outputs for research coordination
 
 - **`utils.py`**: Utility functions including:
@@ -162,6 +163,7 @@ deep_research_openai/
   - `think_tool`: Strategic reflection tool for research planning
   - `refine_draft_report`: Tool for iteratively refining the draft report
   - `tavily_search`: Tavily search tool for research brief and draft generation
+  - `summarize_webpage`: Webpage content summarization with URL tracking for raw notes
   - MCP tool loading and authentication
   - Search API integration (Tavily, OpenAI, Anthropic)
   - Model configuration builders with GPT-5 support
@@ -173,7 +175,8 @@ deep_research_openai/
   - Research planning with diffusion algorithm
   - Draft report generation (with optional search tool instructions)
   - Research execution with strategic reflection
-  - Content summarization and compression (with research topic context)
+  - Webpage summarization (with URL tracking for source attribution)
+  - Content compression (with research topic context)
   - Draft report refinement
   - Final report generation (with insightfulness/helpfulness criteria and multi-language support)
 
@@ -253,8 +256,10 @@ The `MessageSummarizer` class provides automatic context window management by su
 ### Research Notes Persistence
 
 Before final report generation, research notes are asynchronously saved to `/docs` for validation using non-blocking I/O operations:
-- `docs/notes_{timestamp}.md` - Compressed research findings
-- `docs/raw_notes_{timestamp}.md` - Raw tool outputs and AI responses
+- `docs/notes_{timestamp}.md` - Compressed research findings with inline citations
+- `docs/raw_notes_{timestamp}.md` - Raw tool outputs and AI responses with source URLs for enhanced traceability
+
+**Enhanced Source Tracking**: The `Summary` model now includes a `url` field alongside `summary` and `key_excerpts`, ensuring that all summarized web content in raw notes includes the source URL. This enables better verification and validation of research sources.
 
 All file operations use `asyncio.to_thread()` to prevent blocking the ASGI event loop, ensuring optimal performance in production deployments.
 
