@@ -65,6 +65,13 @@ Deep Research offers extensive configuration options to customize the research p
 - **Model Selection**: Configure different models for summarization, research, compression, and final report generation
 - **Azure OpenAI Settings**: Customize endpoint, API version, and deployment names for each model
 
+#### Context Engineering Configuration
+
+- **Enable Context Summarization** (default: true): Whether to enable automatic context summarization when approaching token limits
+- **Max Tokens Before Summary** (default: 100,000): Token threshold to trigger context summarization. When messages exceed this limit, older messages will be summarized
+- **Messages to Keep** (default: 20): Number of recent messages to preserve after summarization
+- **Context Summarization Model** (default: azure_openai:o4-mini): Model to use for context summarization (o4-mini recommended for speed)
+
 ## Architecture Overview
 
 Deep Research Agent uses a sophisticated multi-agent architecture built on LangGraph with the following components:
@@ -88,6 +95,8 @@ Deep Research Agent uses a sophisticated multi-agent architecture built on LangG
 - **Multi-Model Support**: Support for GPT-5, O3, O4-mini and other Azure OpenAI models with flexible configuration
 - **Multi-Language Support**: Automatically detects and responds in the same language as the user's input
 - **Enhanced Quality Criteria**: Final reports follow strict insightfulness (granular breakdowns, detailed tables, nuanced discussion) and helpfulness (satisfying intent, clarity, accuracy) rules
+- **Context Engineering**: Automatic context window summarization using o4-mini when approaching token limits, mirroring LangChain v1's `SummarizationMiddleware`
+- **Research Validation**: Notes and raw notes are asynchronously saved to `/docs` before final report generation for resource validation (non-blocking I/O)
 
 ## Project Structure
 
@@ -103,6 +112,8 @@ deep_research_openai/
 │   │   └── utils.py              # Utility functions, tool loading, and MCP integration
 │   └── security/
 │       └── auth.py               # Supabase authentication for LangGraph Studio
+├── docs/                         # Research notes output directory
+│   └── .gitkeep                 # Placeholder (note files are gitignored)
 ├── tests/                        # Evaluation framework (in development)
 │   ├── evaluators.py            # Quality assessment evaluators
 │   ├── pairwise_evaluation.py   # Head-to-head model comparisons
@@ -123,6 +134,7 @@ deep_research_openai/
   - Search APIs (Tavily, OpenAI, Anthropic)
   - Human-in-the-loop configuration
   - Search enablement for brief and draft nodes
+  - Context summarization settings (token threshold, messages to keep, summarization model)
   - MCP configuration
   - Azure OpenAI settings with separate deployment configurations
   - Supports both environment variables and UI configuration
@@ -132,11 +144,11 @@ deep_research_openai/
   - Research brief generation (with optional Tavily search)
   - Human-in-the-loop research brief approval
   - Draft report generation (with optional Tavily search)
-  - Research supervisor (with diffusion algorithm)
-  - Parallel research execution
-  - Research compression
+  - Research supervisor (with diffusion algorithm and context summarization)
+  - Parallel research execution (with context summarization)
+  - Research compression (with context summarization)
   - Draft report refinement
-  - Final report generation
+  - Final report generation (with async note-saving to `/docs`)
 
 - **`state.py`**: Defines all state classes and data models:
   - `AgentState`: Main workflow state (includes `draft_report` and `brief_refinement_rounds` fields)
@@ -146,6 +158,7 @@ deep_research_openai/
   - Structured outputs for research coordination
 
 - **`utils.py`**: Utility functions including:
+  - `MessageSummarizer`: Context window summarization class (mirrors LangChain v1's `SummarizationMiddleware`)
   - `think_tool`: Strategic reflection tool for research planning
   - `refine_draft_report`: Tool for iteratively refining the draft report
   - `tavily_search`: Tavily search tool for research brief and draft generation
@@ -218,6 +231,33 @@ You have access to specialized research tools:
 
 The agent will automatically load and integrate your custom MCP tools alongside the built-in search capabilities, providing a unified research experience.
 
+## Context Engineering
+
+Deep Research implements context engineering practices inspired by LangChain v1's middleware system, adapted for custom LangGraph StateGraph implementations.
+
+### MessageSummarizer
+
+The `MessageSummarizer` class provides automatic context window management by summarizing older messages when token limits are approached. It mirrors the functionality of LangChain v1's `SummarizationMiddleware`.
+
+**Key Features:**
+- **Token-based triggering**: Summarization triggers when message tokens exceed `max_tokens_before_summary`
+- **Safe cutoff detection**: Preserves AI/Tool message pairs to avoid breaking tool call chains
+- **Configurable token counter**: Defaults to `count_tokens_approximately`, can be customized
+- **Both sync and async support**: `summarize_if_needed()` (async) and `summarize_if_needed_sync()` (sync)
+
+**Applied to nodes:**
+- `supervisor` - Summarizes `supervisor_messages`
+- `researcher` - Summarizes `researcher_messages`  
+- `compress_research` - Summarizes `researcher_messages`
+
+### Research Notes Persistence
+
+Before final report generation, research notes are asynchronously saved to `/docs` for validation using non-blocking I/O operations:
+- `docs/notes_{timestamp}.md` - Compressed research findings
+- `docs/raw_notes_{timestamp}.md` - Raw tool outputs and AI responses
+
+All file operations use `asyncio.to_thread()` to prevent blocking the ASGI event loop, ensuring optimal performance in production deployments.
+
 ## Future Developments
 
 ### Engineering
@@ -225,7 +265,7 @@ The agent will automatically load and integrate your custom MCP tools alongside 
 - Try different search apis and see which one works best
 - Reinforcement learning for better dynamic reasoning/planning + tool use
 - Web Search Resource validation agent
-- Apply Context Engineering practices
+- ~~Apply Context Engineering practices~~ (Completed)
 - Integrate domain specific insights from feedbacks
 
 ### Product/UX

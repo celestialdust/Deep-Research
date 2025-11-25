@@ -4,6 +4,8 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import START, END, StateGraph
 from langgraph.types import Command, interrupt
 import asyncio
+import os
+from datetime import datetime
 from typing import Literal
 from .configuration import (
     Configuration, 
@@ -43,7 +45,9 @@ from .utils import (
     build_model_config,
     think_tool,
     refine_draft_report,
-    tavily_search
+    tavily_search,
+    MessageSummarizer,
+    invoke_model_with_summarization
 )
 
 # Initialize a configurable model that we will use throughout the agent
@@ -80,6 +84,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig)-> Comm
     )
     
     # Check if search is enabled for brief generation
+    raw_notes_content = None
     if configurable.enable_search_for_brief:
         # Use tool-calling model with Tavily search (max 1 search allowed)
         research_model_with_tools = configurable_model.bind_tools([tavily_search]).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(research_model_config)
@@ -95,6 +100,12 @@ async def write_research_brief(state: AgentState, config: RunnableConfig)-> Comm
         if initial_response.tool_calls:
             tool_call = initial_response.tool_calls[0]  # Only execute first tool call
             tool_result = await tavily_search.ainvoke(tool_call["args"], config)
+            
+            # Format raw notes like research agents do
+            raw_notes_content = "\n".join([
+                str(initial_response.content) if initial_response.content else "",
+                str(tool_result)
+            ])
             
             # Add tool message and get structured output
             messages_with_tool = initial_messages + [
@@ -117,11 +128,15 @@ async def write_research_brief(state: AgentState, config: RunnableConfig)-> Comm
             date=get_today_str()
         ))])
     
+    update_dict = {
+        "research_brief": response.research_brief
+    }
+    if raw_notes_content:
+        update_dict["raw_notes"] = [raw_notes_content]
+    
     return Command(
         goto="approve_research_brief", 
-        update={
-            "research_brief": response.research_brief
-        }
+        update=update_dict
     )
 
 
@@ -223,6 +238,7 @@ async def write_draft_report(state: AgentState, config: RunnableConfig) -> Comma
     )
     
     # Check if search is enabled for draft generation
+    raw_notes_content = None
     if configurable.enable_search_for_draft:
         # Use tool-calling model with Tavily search (max 1 search allowed)
         draft_model_with_tools = configurable_model.bind_tools([tavily_search]).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(draft_model_config)
@@ -238,6 +254,12 @@ async def write_draft_report(state: AgentState, config: RunnableConfig) -> Comma
         if initial_response.tool_calls:
             tool_call = initial_response.tool_calls[0]  # Only execute first tool call
             tool_result = await tavily_search.ainvoke(tool_call["args"], config)
+            
+            # Format raw notes like research agents do
+            raw_notes_content = "\n".join([
+                str(initial_response.content) if initial_response.content else "",
+                str(tool_result)
+            ])
             
             # Add tool message and get structured output
             messages_with_tool = initial_messages + [
@@ -260,22 +282,26 @@ async def write_draft_report(state: AgentState, config: RunnableConfig) -> Comma
             date=get_today_str()
         ))])
     
+    update_dict = {
+        "draft_report": response.draft_report,
+        "supervisor_messages": {
+            "type": "override",
+            "value": [
+                SystemMessage(content=lead_researcher_prompt.format(
+                    date=get_today_str(),
+                    max_concurrent_research_units=configurable.max_concurrent_research_units,
+                    max_researcher_iterations=configurable.max_researcher_iterations
+                )),
+                HumanMessage(content=state.get("research_brief", ""))
+            ]
+        }
+    }
+    if raw_notes_content:
+        update_dict["raw_notes"] = [raw_notes_content]
+    
     return Command(
         goto="research_supervisor",
-        update={
-            "draft_report": response.draft_report,
-            "supervisor_messages": {
-                "type": "override",
-                "value": [
-                    SystemMessage(content=lead_researcher_prompt.format(
-                        date=get_today_str(),
-                        max_concurrent_research_units=configurable.max_concurrent_research_units,
-                        max_researcher_iterations=configurable.max_researcher_iterations
-                    )),
-                    HumanMessage(content=state.get("research_brief", ""))
-                ]
-            }
-        }
+        update=update_dict
     )
 
 
@@ -290,7 +316,13 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     lead_researcher_tools = [ConductResearch, ResearchComplete, think_tool, refine_draft_report]
     research_model = configurable_model.bind_tools(lead_researcher_tools).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(research_model_config)
     supervisor_messages = state.get("supervisor_messages", [])
-    response = await research_model.ainvoke(supervisor_messages)
+    
+    response = await invoke_model_with_summarization(
+        model=research_model,
+        messages=supervisor_messages,
+        config=config,
+        message_key="supervisor_messages"
+    )
     return Command(
         goto="supervisor_tools",
         update={
@@ -444,8 +476,13 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         ["langsmith:nostream"]
     )
     research_model = configurable_model.bind_tools(tools).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(research_model_config)
-    # Need to add fault tolerance here.
-    response = await research_model.ainvoke(researcher_messages)
+    
+    response = await invoke_model_with_summarization(
+        model=research_model,
+        messages=researcher_messages,
+        config=config,
+        message_key="researcher_messages"
+    )
     return Command(
         goto="researcher_tools",
         update={
@@ -514,9 +551,15 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     # Update the system prompt to now focus on compression rather than research.
     researcher_messages[0] = SystemMessage(content=compress_research_system_prompt.format(date=get_today_str()))
     researcher_messages.append(HumanMessage(content=compress_research_simple_human_message.format(research_topic=research_topic)))
+    
     while synthesis_attempts < 3:
         try:
-            response = await synthesizer_model.ainvoke(researcher_messages)
+            response = await invoke_model_with_summarization(
+                model=synthesizer_model,
+                messages=researcher_messages,
+                config=config,
+                message_key="researcher_messages"
+            )
             return {
                 "compressed_research": str(response.content),
                 "raw_notes": ["\n".join([str(m.content) for m in filter_messages(researcher_messages, include_types=["tool", "ai"])])]
@@ -545,6 +588,7 @@ researcher_subgraph = researcher_builder.compile()
 
 async def final_report_generation(state: AgentState, config: RunnableConfig):
     notes = state.get("notes", [])
+    raw_notes = state.get("raw_notes", [])
     cleared_state = {"notes": {"type": "override", "value": []},}
     configurable = Configuration.from_runnable_config(config)
     writer_model_config = build_model_config(
@@ -552,6 +596,37 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
         configurable.final_report_model_max_tokens,
         config
     )
+    
+    # Save notes and raw_notes to /docs for resource validation BEFORE LLM call
+    async def save_notes_async():
+        """Save notes to files using async operations to avoid blocking."""
+        def write_file(path: str, content: str):
+            """Helper to write file with proper resource management."""
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        
+        docs_dir = os.path.join(os.path.dirname(__file__), '../../docs')
+        await asyncio.to_thread(os.makedirs, docs_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Save notes
+        if notes:
+            notes_path = os.path.join(docs_dir, f'notes_{timestamp}.md')
+            content = f"# Research Notes - {timestamp}\n\n" + '\n\n---\n\n'.join(notes)
+            await asyncio.to_thread(write_file, notes_path, content)
+            print(f"Notes saved to: {notes_path}")
+        
+        # Save raw_notes
+        if raw_notes:
+            raw_notes_path = os.path.join(docs_dir, f'raw_notes_{timestamp}.md')
+            content = f"# Raw Research Notes - {timestamp}\n\n" + '\n\n---\n\n'.join(raw_notes)
+            await asyncio.to_thread(write_file, raw_notes_path, content)
+            print(f"Raw notes saved to: {raw_notes_path}")
+    
+    try:
+        await save_notes_async()
+    except Exception as e:
+        print(f"Warning: Failed to save notes to /docs: {e}")
     
     findings = "\n".join(notes)
     max_retries = 3
