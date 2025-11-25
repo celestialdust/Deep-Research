@@ -16,7 +16,7 @@ from mcp import McpError
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from .state import Summary, ResearchComplete
 from .configuration import SearchAPI, Configuration
-from .prompts import summarize_webpage_prompt
+from .prompts import summarize_webpage_prompt, report_generation_with_draft_insight_prompt
 
 ##########################
 # Tavily Search Tool Utils
@@ -529,3 +529,69 @@ def build_model_config(model_name: str, max_tokens: int, config: RunnableConfig,
         base_config["model"] = model_name
     
     return base_config
+
+@tool
+def think_tool(reflection: str) -> str:
+    """Tool for strategic reflection on research progress and decision-making.
+    
+    Use this tool after each search to analyze results and plan next steps systematically.
+    This creates a deliberate pause in the research workflow for quality decision-making.
+    
+    When to use:
+    - After receiving search results: What key information did I find?
+    - Before deciding next steps: Do I have enough to answer comprehensively?
+    - When assessing research gaps: What specific information am I still missing?
+    - Before concluding research: Can I provide a complete answer now?
+    
+    Reflection should address:
+    1. Analysis of current findings - What concrete information have I gathered?
+    2. Gap assessment - What crucial information is still missing?
+    3. Quality evaluation - Do I have sufficient evidence/examples for a good answer?
+    4. Strategic decision - Should I continue searching or provide my answer?
+    
+    Args:
+        reflection: Detailed reflection on research progress, findings, gaps, and next steps
+        
+    Returns:
+        Confirmation that reflection was recorded for decision-making
+    """
+    return f"Reflection recorded: {reflection}"
+
+@tool
+def refine_draft_report(
+    research_brief: Annotated[str, InjectedToolArg],
+    findings: Annotated[str, InjectedToolArg], 
+    draft_report: Annotated[str, InjectedToolArg],
+    config: RunnableConfig = None
+) -> str:
+    """Refine draft report using research findings.
+    
+    Synthesizes all research findings into a comprehensive draft report.
+    
+    Args:
+        research_brief: User's research request
+        findings: Collected research findings for the user request
+        draft_report: Draft report based on the findings and user request
+        config: Runtime configuration
+        
+    Returns:
+        Refined draft report
+    """
+    configurable = Configuration.from_runnable_config(config)
+    writer_model_config = build_model_config(
+        configurable.final_report_model,
+        configurable.final_report_model_max_tokens,
+        config
+    )
+    writer_model = init_chat_model(**writer_model_config)
+    
+    draft_report_prompt = report_generation_with_draft_insight_prompt.format(
+        research_brief=research_brief,
+        findings=findings,
+        draft_report=draft_report,
+        date=get_today_str()
+    )
+    
+    response = writer_model.invoke([HumanMessage(content=draft_report_prompt)])
+    
+    return response.content

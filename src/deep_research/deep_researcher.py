@@ -15,6 +15,7 @@ from .state import (
     ResearcherState,
     ClarifyWithUser,
     ResearchQuestion,
+    DraftReport,
     ConductResearch,
     ResearchComplete,
     ResearcherOutputState
@@ -22,6 +23,7 @@ from .state import (
 from .prompts import (
     clarify_with_user_instructions,
     transform_messages_into_research_topic_prompt,
+    draft_report_generation_prompt,
     research_system_prompt,
     compress_research_system_prompt,
     compress_research_simple_human_message,
@@ -38,7 +40,9 @@ from .utils import (
     remove_up_to_last_ai_message,
     get_api_key_for_model,
     get_notes_from_tool_calls,
-    build_model_config
+    build_model_config,
+    think_tool,
+    refine_draft_report
 )
 
 # Initialize a configurable model that we will use throughout the agent
@@ -65,7 +69,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         return Command(goto="write_research_brief", update={"messages": [AIMessage(content=response.verification)]})
 
 
-async def write_research_brief(state: AgentState, config: RunnableConfig)-> Command[Literal["research_supervisor"]]:
+async def write_research_brief(state: AgentState, config: RunnableConfig)-> Command[Literal["write_draft_report"]]:
     configurable = Configuration.from_runnable_config(config)
     research_model_config = build_model_config(
         configurable.research_model,
@@ -79,17 +83,51 @@ async def write_research_brief(state: AgentState, config: RunnableConfig)-> Comm
         date=get_today_str()
     ))])
     return Command(
-        goto="research_supervisor", 
+        goto="write_draft_report", 
         update={
-            "research_brief": response.research_brief,
+            "research_brief": response.research_brief
+        }
+    )
+
+
+async def write_draft_report(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor"]]:
+    """Generate initial draft report from research brief.
+    
+    Creates a preliminary draft report that will be iteratively refined
+    through the research process using the diffusion algorithm.
+    
+    Args:
+        state: Current agent state with research brief
+        config: Runtime configuration
+        
+    Returns:
+        Command to proceed to research supervisor with draft report
+    """
+    configurable = Configuration.from_runnable_config(config)
+    draft_model_config = build_model_config(
+        configurable.research_model,
+        configurable.research_model_max_tokens,
+        config,
+        ["langsmith:nostream"]
+    )
+    draft_model = configurable_model.with_structured_output(DraftReport).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(draft_model_config)
+    response = await draft_model.ainvoke([HumanMessage(content=draft_report_generation_prompt.format(
+        research_brief=state.get("research_brief", ""),
+        date=get_today_str()
+    ))])
+    return Command(
+        goto="research_supervisor",
+        update={
+            "draft_report": response.draft_report,
             "supervisor_messages": {
                 "type": "override",
                 "value": [
                     SystemMessage(content=lead_researcher_prompt.format(
                         date=get_today_str(),
-                        max_concurrent_research_units=configurable.max_concurrent_research_units
+                        max_concurrent_research_units=configurable.max_concurrent_research_units,
+                        max_researcher_iterations=configurable.max_researcher_iterations
                     )),
-                    HumanMessage(content=response.research_brief)
+                    HumanMessage(content=state.get("research_brief", ""))
                 ]
             }
         }
@@ -104,7 +142,7 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
         config,
         ["langsmith:nostream"]
     )
-    lead_researcher_tools = [ConductResearch, ResearchComplete]
+    lead_researcher_tools = [ConductResearch, ResearchComplete, think_tool, refine_draft_report]
     research_model = configurable_model.bind_tools(lead_researcher_tools).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(research_model_config)
     supervisor_messages = state.get("supervisor_messages", [])
     response = await research_model.ainvoke(supervisor_messages)
@@ -122,58 +160,110 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     supervisor_messages = state.get("supervisor_messages", [])
     research_iterations = state.get("research_iterations", 0)
     most_recent_message = supervisor_messages[-1]
+    
     # Exit Criteria
     # 1. We have exceeded our max guardrail research iterations
     # 2. No tool calls were made by the supervisor
-    # 3. The most recent message contains a ResearchComplete tool call and there is only one tool call in the message
+    # 3. The most recent message contains a ResearchComplete tool call
     exceeded_allowed_iterations = research_iterations >= configurable.max_researcher_iterations
     no_tool_calls = not most_recent_message.tool_calls
     research_complete_tool_call = any(tool_call["name"] == "ResearchComplete" for tool_call in most_recent_message.tool_calls)
+    
     if exceeded_allowed_iterations or no_tool_calls or research_complete_tool_call:
         return Command(
             goto=END,
             update={
                 "notes": get_notes_from_tool_calls(supervisor_messages),
-                "research_brief": state.get("research_brief", "")
+                "research_brief": state.get("research_brief", ""),
+                "draft_report": state.get("draft_report", "")
             }
         )
-    # Otherwise, conduct research and gather results.
+    
+    # Otherwise, execute tool calls and gather results
     try:
-        all_conduct_research_calls = [tool_call for tool_call in most_recent_message.tool_calls if tool_call["name"] == "ConductResearch"]
-        conduct_research_calls = all_conduct_research_calls[:configurable.max_concurrent_research_units]
-        overflow_conduct_research_calls = all_conduct_research_calls[configurable.max_concurrent_research_units:]
-        researcher_system_prompt = research_system_prompt.format(mcp_prompt=configurable.mcp_prompt or "", date=get_today_str())
-        coros = [
-            researcher_subgraph.ainvoke({
-                "researcher_messages": [
-                    SystemMessage(content=researcher_system_prompt),
-                    HumanMessage(content=tool_call["args"]["research_topic"])
-                ],
-                "research_topic": tool_call["args"]["research_topic"]
-            }, config) 
-            for tool_call in conduct_research_calls
-        ]
-        tool_results = await asyncio.gather(*coros)
-        tool_messages = [ToolMessage(
-                            content=observation.get("compressed_research", "Error synthesizing research report: Maximum retries exceeded"),
-                            name=tool_call["name"],
-                            tool_call_id=tool_call["id"]
-                        ) for observation, tool_call in zip(tool_results, conduct_research_calls)]
-        # Handle any tool calls made > max_concurrent_research_units
-        for overflow_conduct_research_call in overflow_conduct_research_calls:
+        tool_messages = []
+        all_raw_notes = []
+        updated_draft_report = state.get("draft_report", "")
+        
+        # Separate tool calls by type
+        think_tool_calls = [tc for tc in most_recent_message.tool_calls if tc["name"] == "think_tool"]
+        conduct_research_calls = [tc for tc in most_recent_message.tool_calls if tc["name"] == "ConductResearch"]
+        refine_report_calls = [tc for tc in most_recent_message.tool_calls if tc["name"] == "refine_draft_report"]
+        
+        # Handle think_tool calls
+        for tool_call in think_tool_calls:
+            observation = think_tool.invoke(tool_call["args"])
             tool_messages.append(ToolMessage(
-                content=f"Error: Did not run this research as you have already exceeded the maximum number of concurrent research units. Please try again with {configurable.max_concurrent_research_units} or fewer research units.",
-                name="ConductResearch",
-                tool_call_id=overflow_conduct_research_call["id"]
+                content=observation,
+                name=tool_call["name"],
+                tool_call_id=tool_call["id"]
             ))
-        raw_notes_concat = "\n".join(["\n".join(observation.get("raw_notes", [])) for observation in tool_results])
+        
+        # Handle ConductResearch calls
+        if conduct_research_calls:
+            all_conduct_research_calls = conduct_research_calls
+            conduct_research_calls = all_conduct_research_calls[:configurable.max_concurrent_research_units]
+            overflow_conduct_research_calls = all_conduct_research_calls[configurable.max_concurrent_research_units:]
+            
+            researcher_system_prompt = research_system_prompt.format(mcp_prompt=configurable.mcp_prompt or "", date=get_today_str())
+            coros = [
+                researcher_subgraph.ainvoke({
+                    "researcher_messages": [
+                        SystemMessage(content=researcher_system_prompt),
+                        HumanMessage(content=tool_call["args"]["research_topic"])
+                    ],
+                    "research_topic": tool_call["args"]["research_topic"]
+                }, config) 
+                for tool_call in conduct_research_calls
+            ]
+            tool_results = await asyncio.gather(*coros)
+            
+            research_tool_messages = [ToolMessage(
+                content=observation.get("compressed_research", "Error synthesizing research report: Maximum retries exceeded"),
+                name=tool_call["name"],
+                tool_call_id=tool_call["id"]
+            ) for observation, tool_call in zip(tool_results, conduct_research_calls)]
+            
+            tool_messages.extend(research_tool_messages)
+            
+            # Handle overflow
+            for overflow_call in overflow_conduct_research_calls:
+                tool_messages.append(ToolMessage(
+                    content=f"Error: Did not run this research as you have already exceeded the maximum number of concurrent research units. Please try again with {configurable.max_concurrent_research_units} or fewer research units.",
+                    name="ConductResearch",
+                    tool_call_id=overflow_call["id"]
+                ))
+            
+            raw_notes_concat = "\n".join(["\n".join(observation.get("raw_notes", [])) for observation in tool_results])
+            all_raw_notes.append(raw_notes_concat)
+        
+        # Handle refine_draft_report calls
+        for tool_call in refine_report_calls:
+            notes = get_notes_from_tool_calls(supervisor_messages)
+            findings = "\n".join(notes)
+            
+            draft_report = refine_draft_report.invoke({
+                "research_brief": state.get("research_brief", ""),
+                "findings": findings,
+                "draft_report": state.get("draft_report", "")
+            }, config)
+            
+            updated_draft_report = draft_report
+            tool_messages.append(ToolMessage(
+                content=draft_report,
+                name=tool_call["name"],
+                tool_call_id=tool_call["id"]
+            ))
+        
         return Command(
             goto="supervisor",
             update={
                 "supervisor_messages": tool_messages,
-                "raw_notes": [raw_notes_concat]
+                "raw_notes": all_raw_notes if all_raw_notes else [],
+                "draft_report": updated_draft_report
             }
         )
+        
     except Exception as e:
         if is_token_limit_exceeded(e, configurable.research_model):
             print(f"Token limit exceeded while reflecting: {e}")
@@ -183,7 +273,8 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             goto=END,
             update={
                 "notes": get_notes_from_tool_calls(supervisor_messages),
-                "research_brief": state.get("research_brief", "")
+                "research_brief": state.get("research_brief", ""),
+                "draft_report": state.get("draft_report", "")
             }
         )
 
@@ -274,9 +365,10 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
         ["langsmith:nostream"]
     ))
     researcher_messages = state.get("researcher_messages", [])
+    research_topic = state.get("research_topic", "")
     # Update the system prompt to now focus on compression rather than research.
     researcher_messages[0] = SystemMessage(content=compress_research_system_prompt.format(date=get_today_str()))
-    researcher_messages.append(HumanMessage(content=compress_research_simple_human_message))
+    researcher_messages.append(HumanMessage(content=compress_research_simple_human_message.format(research_topic=research_topic)))
     while synthesis_attempts < 3:
         try:
             response = await synthesizer_model.ainvoke(researcher_messages)
@@ -323,6 +415,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
         final_report_prompt = final_report_generation_prompt.format(
             research_brief=state.get("research_brief", ""),
             findings=findings,
+            draft_report=state.get("draft_report", ""),
             date=get_today_str()
         )
         try:
@@ -362,9 +455,12 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
 deep_researcher_builder = StateGraph(AgentState, input=AgentInputState, config_schema=Configuration)
 deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)
 deep_researcher_builder.add_node("write_research_brief", write_research_brief)
+deep_researcher_builder.add_node("write_draft_report", write_draft_report)
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)
 deep_researcher_builder.add_edge(START, "clarify_with_user")
+deep_researcher_builder.add_edge("write_research_brief", "write_draft_report")
+deep_researcher_builder.add_edge("write_draft_report", "research_supervisor")
 deep_researcher_builder.add_edge("research_supervisor", "final_report_generation")
 deep_researcher_builder.add_edge("final_report_generation", END)
 

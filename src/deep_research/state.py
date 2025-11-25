@@ -37,6 +37,11 @@ class ResearchQuestion(BaseModel):
         description="A research question that will be used to guide the research.",
     )
 
+class DraftReport(BaseModel):
+    draft_report: str = Field(
+        description="A draft report that will be used to guide the research.",
+    )
+
 
 ###################
 # State Definitions
@@ -56,6 +61,7 @@ class AgentState(MessagesState):
     research_brief: Optional[str]
     raw_notes: Annotated[list[str], override_reducer] = []
     notes: Annotated[list[str], override_reducer] = []
+    draft_report: str
     final_report: str
 
 class SupervisorState(TypedDict):
@@ -64,6 +70,7 @@ class SupervisorState(TypedDict):
     notes: Annotated[list[str], override_reducer] = []
     research_iterations: int = 0
     raw_notes: Annotated[list[str], override_reducer] = []
+    draft_report: str
 
 class ResearcherState(TypedDict):
     researcher_messages: Annotated[list[MessageLikeRepresentation], operator.add]

@@ -152,11 +152,11 @@ class Configuration(BaseModel):
     
     # Model Configuration
     summarization_model: str = Field(
-        default="azure_openai:o4-mini",
+        default="azure_openai:o3",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
-                "default": "azure_openai:o4-mini",
+                "default": "azure_openai:o3",
                 "description": "Model for summarizing research results from OpenAI search results"
             }
         }
@@ -231,7 +231,9 @@ class Configuration(BaseModel):
             }
         }
     )
-    # MCP server configuration
+
+    # MCP server configuration for the deep research agent
+    # see load_mcp_tools in utils.py for more details
     mcp_config: Optional[MCPConfig] = Field(
         default=None,
         optional=True,
