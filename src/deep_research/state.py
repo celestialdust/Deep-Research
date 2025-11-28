@@ -18,7 +18,6 @@ class ResearchComplete(BaseModel):
     """Call this tool to indicate that the research is complete."""
 
 class Summary(BaseModel):
-    url: str
     summary: str
     key_excerpts: str
 

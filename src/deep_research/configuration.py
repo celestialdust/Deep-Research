@@ -65,7 +65,7 @@ class Configuration(BaseModel):
         }
     )
     enable_human_in_the_loop: bool = Field(
-        default=True,
+        default=False,
         metadata={
             "x_oap_ui_config": {
                 "type": "boolean",
@@ -140,7 +140,7 @@ class Configuration(BaseModel):
         }
     )
     enable_search_for_draft: bool = Field(
-        default=True,
+        default=False,
         metadata={
             "x_oap_ui_config": {
                 "type": "boolean",
@@ -313,6 +313,52 @@ class Configuration(BaseModel):
             "x_oap_ui_config": {
                 "type": "text",
                 "description": "Any additional instructions to pass along to the Agent regarding the MCP tools that are available to it."
+            }
+        }
+    )
+
+    # Context Summarization Configuration
+    enable_context_summarization: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Whether to enable automatic context summarization when approaching token limits"
+            }
+        }
+    )
+    max_tokens_before_summary: int = Field(
+        default=100000,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 100000,
+                "min": 10000,
+                "max": 200000,
+                "description": "Token threshold to trigger context summarization. When messages exceed this limit, older messages will be summarized."
+            }
+        }
+    )
+    messages_to_keep: int = Field(
+        default=20,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 20,
+                "min": 5,
+                "max": 50,
+                "description": "Number of recent messages to preserve after summarization"
+            }
+        }
+    )
+    context_summarization_model: str = Field(
+        default="azure_openai:o4-mini",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "azure_openai:o4-mini",
+                "description": "Model to use for context summarization (o4-mini recommended for speed)"
             }
         }
     )

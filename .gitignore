@@ -67,3 +67,7 @@ tmp/
 temp/
 
 .langgraph_api
+
+# Research notes (saved for validation but not committed)
+docs/notes_*.md
+docs/raw_notes_*.md
