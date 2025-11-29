@@ -42,7 +42,7 @@ class Configuration(BaseModel):
         }
     )
     allow_clarification: bool = Field(
-        default=True,
+        default=False,
         metadata={
             "x_oap_ui_config": {
                 "type": "boolean",
@@ -140,7 +140,7 @@ class Configuration(BaseModel):
         }
     )
     enable_search_for_draft: bool = Field(
-        default=False,
+        default=True,
         metadata={
             "x_oap_ui_config": {
                 "type": "boolean",
@@ -214,7 +214,7 @@ class Configuration(BaseModel):
     
     # Model Configuration
     summarization_model: str = Field(
-        default="azure_openai:gpt-5",
+        default="azure_openai:o4-mini",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
@@ -234,7 +234,7 @@ class Configuration(BaseModel):
         }
     )
     research_model: str = Field(
-        default="azure_openai:gpt-5",
+        default="azure_openai:o4-mini",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",

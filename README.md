@@ -97,6 +97,8 @@ Deep Research Agent uses a sophisticated multi-agent architecture built on LangG
 - **Enhanced Quality Criteria**: Final reports follow strict insightfulness (granular breakdowns, detailed tables, nuanced discussion) and helpfulness (satisfying intent, clarity, accuracy) rules
 - **Context Engineering**: Automatic context window summarization using o4-mini when approaching token limits, mirroring LangChain v1's `SummarizationMiddleware`
 - **Research Validation**: Notes and raw notes are asynchronously saved to `/docs` before final report generation for resource validation (non-blocking I/O)
+- **Retraceable Citations**: Text-fragment links enable one-click navigation to the exact source sentence supporting each claim (see [Citations](#retraceable-citations))
+- **PDF Export**: Automatic conversion of final reports to professional PDF format with serif fonts and proper margins (see [PDF Export](#pdf-export))
 
 ## Project Structure
 
@@ -143,17 +145,20 @@ deep_research_openai/
   - User clarification
   - Research brief generation (with optional Tavily search)
   - Human-in-the-loop research brief approval
-  - Draft report generation (with optional Tavily search)
+  - Draft report generation (with optional Tavily search and text-fragment citations)
   - Research supervisor (with diffusion algorithm and context summarization)
   - Parallel research execution (with context summarization)
-  - Research compression (with context summarization)
+  - Research compression (with exact source sentence preservation)
   - Draft report refinement
-  - Final report generation (with async note-saving to `/docs`)
+  - Final report generation (with text-fragment citations and async note-saving to `/docs`)
+  - PDF conversion (markdown → HTML → PDF with WeasyPrint)
 
 - **`state.py`**: Defines all state classes and data models:
-  - `AgentState`: Main workflow state (includes `draft_report` and `brief_refinement_rounds` fields)
+  - `AgentState`: Main workflow state (includes `draft_report`, `brief_refinement_rounds`, `pdf_path`, `pdf_generation_status` fields)
   - `SupervisorState`: Research supervisor state (includes `draft_report` field)
   - `ResearcherState`: Individual researcher state
+  - `ClaimSourcePair`: Atomic claim with exact source sentence for text-fragment citations (claim + source_sentence fields)
+  - `Summary`: Structured webpage summary with claim-source pairs where every key claim is backed by a source sentence
   - `DraftReport`: Structured output for draft report generation
   - Structured outputs for research coordination
 
@@ -162,6 +167,9 @@ deep_research_openai/
   - `think_tool`: Strategic reflection tool for research planning
   - `refine_draft_report`: Tool for iteratively refining the draft report
   - `tavily_search`: Tavily search tool for research brief and draft generation
+  - `summarize_webpage`: Webpage summarization with atomic claim-source pair extraction (with automatic retry on token limits)
+  - PDF generation utilities: `generate_pdf_from_markdown`, `save_markdown_file`, `extract_title_from_markdown`, `sanitize_filename`
+  - `PDF_CSS_STYLES`: Professional CSS styling for PDF reports
   - MCP tool loading and authentication
   - Search API integration (Tavily, OpenAI, Anthropic)
   - Model configuration builders with GPT-5 support
@@ -171,11 +179,12 @@ deep_research_openai/
   - Research clarification
   - Research brief generation (with optional search tool instructions)
   - Research planning with diffusion algorithm
-  - Draft report generation (with optional search tool instructions)
+  - Draft report generation (with text-fragment citation guidelines)
   - Research execution with strategic reflection
-  - Content summarization and compression (with research topic context)
+  - Webpage summarization with atomic claim-source pair extraction (every key claim must be backed by a source sentence)
+  - Content summarization and compression (with exact source sentence preservation)
   - Draft report refinement
-  - Final report generation (with insightfulness/helpfulness criteria and multi-language support)
+  - Final report generation (with text-fragment citations, insightfulness/helpfulness criteria, and multi-language support)
 
 #### `src/security/`
 
@@ -258,6 +267,133 @@ Before final report generation, research notes are asynchronously saved to `/doc
 
 All file operations use `asyncio.to_thread()` to prevent blocking the ASGI event loop, ensuring optimal performance in production deployments.
 
+## Retraceable Citations
+
+Deep Research generates citations with text-fragment links that navigate directly to the supporting sentence in source documents, enabling one-click verification of claims.
+
+### How It Works
+
+1. **Webpage Summarization**: When webpages are summarized, the system extracts atomic claim-source pairs for the most important key claims:
+   - `claim`: A key factual claim from the summary (headline-worthy facts)
+   - `source_sentence`: The exact verbatim sentence from the source
+   
+   **Selective Extraction**: Only 3-7 most citation-worthy claims get source sentences (headline facts, primary findings, unique insights). The summary remains comprehensive while claim-source pairs focus on the most important facts likely to be cited in final reports.
+   
+   The summarization includes robust error handling:
+   - Automatic content truncation to stay within token limits (default 30,000 chars)
+   - Retry with shorter content on token limit errors
+   - Graceful fallback to raw content excerpt if summarization fails
+   - Extended timeout (180 seconds initial, 120 seconds retry) for complex pages
+
+2. **Compression Agent**: Research findings are compressed while preserving exact source sentences for each citation. The URL context is provided in the source header for each webpage.
+
+3. **Report Generation**: Draft and final reports generate text-fragment links using the format:
+   ```
+   [number](url#:~:text=encoded_sentence)
+   ```
+
+### Citation Format
+
+**In-text citations**:
+```markdown
+AI adoption increased significantly [1](https://example.com/article#:~:text=AI%20adoption%20increased%2050%25%20in%202024)
+```
+
+**Sources section**:
+```markdown
+### Sources
+[1] Article Title: https://example.com/article
+[2] Study Name: https://example.com/study
+```
+
+### Text Fragment Format (Range Matching)
+
+Deep Research uses **range matching** to highlight the ENTIRE source sentence:
+
+```
+#:~:text=first%20five%20words,last%20five%20words
+```
+
+- **Start anchor**: First ~5 words of the source sentence
+- **End anchor**: Last ~5 words of the source sentence
+- **Result**: The complete sentence gets highlighted when clicked
+
+**Example:**
+Source sentence: "As part of our Sonnet 4.5 launch, we released a memory tool that allows agents to store information without keeping everything in context."
+
+```
+https://anthropic.com/blog#:~:text=As%20part%20of%20our%20Sonnet,without%20keeping%20everything%20in%20context
+```
+
+When clicked, this highlights the entire sentence from "As part of our Sonnet..." through "...without keeping everything in context."
+
+### URL Encoding Rules (per WICG Spec)
+
+Only these characters MUST be percent-encoded:
+- Space → `%20`
+- `&` → `%26`
+- `-` → `%2D`
+- `,` → `%2C`
+- Non-ASCII: UTF-8 encode, then percent-encode
+
+Characters that do NOT need encoding: `= # ? : ! $ ' ( ) * + . / ; @ _ ~`
+
+### Fallback Behavior
+
+If text-fragment generation fails (encoding error, sentence unavailable), the system falls back to regular URLs without fragments.
+
+**Reference**: [WICG Scroll-to-Text Fragment Spec](https://wicg.github.io/scroll-to-text-fragment/)
+
+## PDF Export
+
+Final research reports are automatically converted to professional PDF format matching the OpenAI deep research aesthetic.
+
+### Features
+
+- **Professional Styling**: Serif fonts (Georgia, Times New Roman), 1-inch margins, proper heading hierarchy
+- **Print-Friendly**: Optimized for both screen viewing and printing
+- **Table Support**: Clean table formatting with alternating row colors
+- **Code Blocks**: Syntax-highlighted code with proper formatting
+- **Automatic Fallback**: If PDF generation fails or dependencies are missing, saves markdown to `/docs/` instead
+- **Modular Design**: PDF generation utilities in `utils.py` for reusability
+
+### Output Location
+
+PDFs (or markdown fallback) are saved to:
+```
+/docs/{sanitized_title}_{timestamp}.pdf   # If WeasyPrint is installed
+/docs/{sanitized_title}_{timestamp}.md    # Fallback if PDF fails
+```
+
+### System Dependencies
+
+WeasyPrint requires native libraries for PDF generation:
+
+**macOS**:
+```bash
+brew install cairo pango gdk-pixbuf libffi gobject-introspection
+```
+
+**Ubuntu/Debian**:
+```bash
+apt-get install libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 libffi-dev shared-mime-info
+```
+
+**Note**: If system dependencies are missing, the system falls back to saving reports as markdown files.
+
+### State Fields
+
+The `AgentState` includes PDF-related fields:
+- `pdf_path`: Path to the generated PDF file (or markdown fallback)
+- `pdf_generation_status`: Status indicator (`"pending"`, `"success"`, `"failed"`)
+
+### Workflow Integration
+
+The PDF conversion node runs after final report generation:
+```
+final_report_generation → convert_to_pdf → END
+```
+
 ## Future Developments
 
 ### Engineering
@@ -266,6 +402,8 @@ All file operations use `asyncio.to_thread()` to prevent blocking the ASGI event
 - Reinforcement learning for better dynamic reasoning/planning + tool use
 - Web Search Resource validation agent
 - ~~Apply Context Engineering practices~~ (Completed)
+- ~~Retraceable Citations with Text-Fragment Links~~ (Completed)
+- ~~PDF Export for Professional Reports~~ (Completed)
 - Integrate domain specific insights from feedbacks
 
 ### Product/UX

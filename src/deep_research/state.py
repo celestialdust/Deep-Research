@@ -17,9 +17,25 @@ class ConductResearch(BaseModel):
 class ResearchComplete(BaseModel):
     """Call this tool to indicate that the research is complete."""
 
+class ClaimSourcePair(BaseModel):
+    """Atomic claim with its supporting source sentence for text-fragment link generation."""
+    claim: str = Field(
+        description="A single factual claim extracted from the webpage"
+    )
+    source_sentence: str = Field(
+        description="The exact verbatim sentence from the source that supports this claim - do NOT paraphrase"
+    )
+
+
 class Summary(BaseModel):
-    summary: str
-    key_excerpts: str
+    """Structured summary output with atomic claim-source pairs for citation generation."""
+    summary: str = Field(
+        description="A comprehensive summary of the webpage content"
+    )
+    claim_source_pairs: list[ClaimSourcePair] = Field(
+        description="List of atomic claim-source pairs extracted from the webpage",
+        default_factory=list
+    )
 
 class ClarifyWithUser(BaseModel):
     need_clarification: bool = Field(
@@ -64,6 +80,8 @@ class AgentState(MessagesState):
     draft_report: str
     final_report: str
     brief_refinement_rounds: int = 0
+    pdf_path: Optional[str] = None
+    pdf_generation_status: str = "pending"  # "pending", "success", "failed"
 
 class SupervisorState(TypedDict):
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]

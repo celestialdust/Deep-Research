@@ -47,7 +47,11 @@ from .utils import (
     refine_draft_report,
     tavily_search,
     MessageSummarizer,
-    invoke_model_with_summarization
+    invoke_model_with_summarization,
+    extract_title_from_markdown,
+    sanitize_filename,
+    generate_pdf_from_markdown,
+    save_markdown_file
 )
 
 # Initialize a configurable model that we will use throughout the agent
@@ -672,6 +676,76 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
         **cleared_state
     }
 
+
+async def convert_to_pdf(state: AgentState, config: RunnableConfig):
+    """Convert the final report from markdown to PDF.
+    
+    Uses WeasyPrint to convert markdown → HTML → PDF with professional styling.
+    On failure, saves markdown as fallback and continues workflow.
+    
+    Args:
+        state: Current agent state containing final_report
+        config: Runtime configuration
+        
+    Returns:
+        Dictionary with pdf_path and pdf_generation_status
+    """
+    
+    
+    final_report = state.get("final_report", "")
+    
+    if not final_report:
+        return {
+            "pdf_path": None,
+            "pdf_generation_status": "skipped"
+        }
+    
+    # Extract and sanitize title for filename
+    title = extract_title_from_markdown(final_report)
+    sanitized_title = sanitize_filename(title)
+    
+    # Setup paths
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    docs_dir = os.path.join(os.path.dirname(__file__), '../../docs')
+    
+    # Ensure docs directory exists
+    try:
+        await asyncio.to_thread(os.makedirs, docs_dir, exist_ok=True)
+    except Exception as e:
+        print(f"Warning: Failed to create docs directory: {e}")
+        return {
+            "pdf_path": None,
+            "pdf_generation_status": "failed"
+        }
+    
+    pdf_path = os.path.join(docs_dir, f"{sanitized_title}_{timestamp}.pdf")
+    md_fallback_path = os.path.join(docs_dir, f"{sanitized_title}_{timestamp}.md")
+    
+    pdf_success = await generate_pdf_from_markdown(final_report, pdf_path, title)
+    
+    if pdf_success:
+        print(f"PDF generated successfully: {pdf_path}")
+        return {
+            "pdf_path": pdf_path,
+            "pdf_generation_status": "success"
+        }
+    
+    # PDF generation failed - save markdown as fallback
+    md_success = await save_markdown_file(final_report, md_fallback_path)
+    
+    if md_success:
+        print(f"Markdown fallback saved to: {md_fallback_path}")
+        return {
+            "pdf_path": md_fallback_path,
+            "pdf_generation_status": "failed"
+        }
+    
+    return {
+        "pdf_path": None,
+        "pdf_generation_status": "failed"
+    }
+
+
 deep_researcher_builder = StateGraph(AgentState, input=AgentInputState, config_schema=Configuration)
 deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)
 deep_researcher_builder.add_node("write_research_brief", write_research_brief)
@@ -679,8 +753,10 @@ deep_researcher_builder.add_node("approve_research_brief", approve_research_brie
 deep_researcher_builder.add_node("write_draft_report", write_draft_report)
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)
+deep_researcher_builder.add_node("convert_to_pdf", convert_to_pdf)
 deep_researcher_builder.add_edge(START, "clarify_with_user")
 deep_researcher_builder.add_edge("research_supervisor", "final_report_generation")
-deep_researcher_builder.add_edge("final_report_generation", END)
+deep_researcher_builder.add_edge("final_report_generation", "convert_to_pdf")
+deep_researcher_builder.add_edge("convert_to_pdf", END)
 
 graph = deep_researcher_builder.compile(name = "deep_researcher")

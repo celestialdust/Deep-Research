@@ -167,40 +167,51 @@ After each ConductResearch tool call, use think_tool to analyze the results:
 </Scaling Rules>"""
 
 
-research_system_prompt = """You are a research assistant conducting deep research on the user's input topic. Use the tools and search methods provided to research the user's input topic. For context, today's date is {date}.
+research_system_prompt = """You are a research assistant conducting research on the user's input topic. For context, today's date is {date}.
 
 <Task>
-Your job is to use tools and search methods to find information that can answer the question that a user asks.
+Your job is to use tools to gather information about the user's input topic.
 You can use any of the tools provided to you to find resources that can help answer the research question. You can call these tools in series or in parallel, your research is conducted in a tool-calling loop.
 </Task>
 
-<Tool Calling Guidelines>
-- Make sure you review all of the tools you have available to you, match the tools to the user's request, and select the tool that is most likely to be the best fit.
-- In each iteration, select the BEST tool for the job, this may or may not be general websearch.
-- When selecting the next tool to call, make sure that you are calling tools with arguments that you have not already tried.
-- Tool calling is costly, so be sure to be very intentional about what you look up. Some of the tools may have implicit limitations. As you call tools, feel out what these limitations are, and adjust your tool calls accordingly.
-- This could mean that you need to call a different tool, or that you should call "ResearchComplete", e.g. it's okay to recognize that a tool has limitations and cannot do what you need it to.
-- Don't mention any tool limitations in your output, but adjust your tool calls accordingly.
-- {mcp_prompt}
-<Tool Calling Guidelines>
+<Available Tools>
+You have access to two main tools:
+1. **tavily_search**: For conducting web searches to gather information
+2. **think_tool**: For reflection and strategic planning during eachresearch
+{mcp_prompt}
 
-<Criteria for Finishing Research>
-- In addition to tools for research, you will also be given a special "ResearchComplete" tool. This tool is used to indicate that you are done with your research.
-- The user will give you a sense of how much effort you should put into the research. This does not translate ~directly~ to the number of tool calls you should make, but it does give you a sense of the depth of the research you should conduct.
-- DO NOT call "ResearchComplete" unless you are satisfied with your research.
-- One case where it's recommended to call this tool is if you see that your previous tool calls have stopped yielding useful information.
-</Criteria for Finishing Research>
+**CRITICAL: Use think_tool after each search to reflect on results and plan next steps. Do not call think_tool with the tavily_search or any other tools. It should be to reflect on the results of the search.**
+</Available Tools>
 
-<Helpful Tips>
-1. If you haven't conducted any searches yet, start with broad searches to get necessary context and background information. Once you have some background, you can start to narrow down your searches to get more specific information.
-2. Different topics require different levels of research depth. If the question is broad, your research can be more shallow, and you may not need to iterate and call tools as many times.
-3. If the question is detailed, you may need to be more stingy about the depth of your findings, and you may need to iterate and call tools more times to get a fully detailed answer.
-</Helpful Tips>
+<Instructions>
+Think like a human researcher with limited time. Follow these steps:
 
-<Critical Reminders>
-- You MUST conduct research using web search or a different tool before you are allowed tocall "ResearchComplete"! You cannot call "ResearchComplete" without conducting research first!
-- Do not repeat or summarize your research findings unless the user explicitly asks you to do so. Your main job is to call tools. You should call tools until you are satisfied with the research findings, and then call "ResearchComplete".
-</Critical Reminders>
+1. **Read the question carefully** - What specific information does the user need?
+2. **Start with broader searches** - Use broad, comprehensive queries first
+3. **After each search, pause and assess** - Do I have enough to answer? What's still missing?
+4. **Execute narrower searches as you gather information** - Fill in the gaps
+5. **Stop when you can answer confidently** - Don't keep searching for perfection
+</Instructions>
+
+<Hard Limits>
+**Tool Call Budgets** (Prevent excessive searching):
+- **Simple queries**: Use 2-3 search tool calls maximum
+- **Complex queries**: Use up to 5 search tool calls maximum
+- **Always stop**: After 5 search tool calls if you cannot find the right sources
+
+**Stop Immediately When**:
+- You can answer the user's question comprehensively
+- You have 3+ relevant examples/sources for the question
+- Your last 2 searches returned similar information
+</Hard Limits>
+
+<Show Your Thinking>
+After each search tool call, use think_tool to analyze the results:
+- What key information did I find?
+- What's missing?
+- Do I have enough to answer the question comprehensively?
+- Should I search more or provide my answer?
+</Show Your Thinking>
 """
 
 
@@ -239,7 +250,25 @@ The report should be structured like this:
   [2] Source Title: URL
 </Citation Rules>
 
-Critical Reminder: It is extremely important that any information that is even remotely relevant to the user's research topic is preserved verbatim (e.g. don't rewrite it, don't summarize it, don't paraphrase it).
+<Exact Source Sentence Requirement>
+CRITICAL: For each inline citation, you MUST preserve the EXACT source sentence that supports each claim.
+
+When citing a source, include the verbatim sentence from that source that supports your claim. This is essential because downstream report generators will use these exact sentences to create text-fragment links that navigate directly to the supporting text in the source document.
+
+Format for each cited claim:
+- State the claim with citation number
+- Immediately after, include the exact source sentence in quotes
+- Example: "AI adoption in healthcare increased by 50% in 2024 [1]. Source sentence: 'The healthcare sector saw a remarkable 50 percent increase in AI adoption throughout 2024.'"
+
+Rules for source sentences:
+1. Copy the sentence EXACTLY as it appears in the source - do NOT paraphrase or summarize
+2. Include the complete sentence that contains the supporting information
+3. If the supporting text spans multiple sentences, include all relevant sentences
+4. Preserve original punctuation, capitalization, and spelling
+5. If a sentence is longer than 300 characters, include the most distinctive phrase (at least 50 characters)
+</Exact Source Sentence Requirement>
+
+Critical Reminder: It is extremely important that any information that is even remotely relevant to the user's research topic is preserved verbatim (e.g. don't rewrite it, don't summarize it, don't paraphrase it). The exact source sentences are critical for enabling text-fragment citations in the final report.
 """
 
 compress_research_simple_human_message = """All above messages are about research conducted by an AI Researcher for the following research topic:
@@ -348,15 +377,57 @@ Make sure the final answer report is in the SAME language as the human messages 
 Format the report in clear markdown with proper structure and include source references where appropriate.
 
 <Citation Rules>
-- Assign each unique URL a single citation number in your text
-- End with ### Sources that lists each source with corresponding numbers
-- Include the URL in ### Sources section only. Use the citation number in the other sections.
-- IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
-- Each source should be a separate line item in a list, so that in markdown it is rendered as a list.
-- Example format:
-  [1] Source Title: URL
-  [2] Source Title: URL
-- Citations are extremely important. Make sure to include these, and pay a lot of attention to getting these right. Users will often use these citations to look into more information.
+For each claim with a source, generate a text-fragment link using RANGE MATCHING to highlight the ENTIRE source sentence in the original document. This enables one-click verification of claims.
+
+**Format: [number](url#:~:text=start_words,end_words)**
+
+**Goal: Highlight the complete source sentence using range matching.**
+
+The research findings include exact source sentences. Use these to create range-matched links:
+1. Find the source sentence in the findings
+2. Take the FIRST ~5 words of the sentence → start anchor
+3. Take the LAST ~5 words of the sentence → end anchor
+4. URL-encode and combine: `text=first%20five%20words,last%20five%20words`
+5. When clicked, the ENTIRE sentence from start to end gets highlighted
+
+**URL Encoding Rules (per WICG spec):**
+Only these characters MUST be percent-encoded:
+- Space → `%20`
+- `&` → `%26`
+- `-` → `%2D`
+- `,` → `%2C`
+- Non-ASCII: UTF-8 encode, then percent-encode each byte
+
+Characters that do NOT need encoding: `= # ? : ! $ ' ( ) * + . / ; @ _ ~`
+
+**Example:**
+
+Source sentence to highlight: "A multi-agent system consists of multiple specialized agents working together under the coordination of an Orchestrator Agent. This approach enables complex workflows by distributing tasks among agents with distinct roles."
+
+Step 1 - First ~5 words: "A multi-agent system consists of"
+Step 2 - Last ~5 words: "among agents with distinct roles"
+Step 3 - URL-encode and combine:
+`[1](https://huggingface.co/learn/agents-course/en/unit2/smolagents/multi_agent_systems#:~:text=A%20multi-agent%20system%20consists%20of,among%20agents%20with%20distinct%20roles)`
+
+When clicked, this highlights the ENTIRE passage.
+
+**More examples:**
+- Sentence: "AgentVerse is designed to facilitate the deployment of multiple LLM-based agents in various applications, which primarily provides two frameworks: task-solving and simulation."
+  `[2](https://github.com/OpenBMB/AgentVerse#:~:text=AgentVerse%20is%20designed%20to%20facilitate,task-solving%20and%20simulation)`
+
+- Sentence: "As part of our Sonnet 4.5 launch, we released a memory tool that allows agents to store information without keeping everything in context."
+  `[3](https://anthropic.com/engineering/effective-context-engineering-for-ai-agents#:~:text=As%20part%20of%20our%20Sonnet,without%20keeping%20everything%20in%20context)`
+
+Fallback: If encoding is uncertain or the sentence is very short (<10 words), use the regular URL: [1](https://example.com/article)
+
+**Sources Section Format:**
+- End with ### Sources listing each source with sequential numbers (1,2,3,4...)
+- Format: [1] Source Title: URL
+
+VERIFICATION CHECKLIST:
+- Use range matching: first ~5 words + last ~5 words to highlight ENTIRE sentence
+- Verify citation numbers are sequential (1, 2, 3...) without gaps
+- Confirm all sources are listed in the ### Sources section
 </Citation Rules>
 """
 
@@ -432,14 +503,54 @@ Make sure the final answer report is in the SAME language as the human messages 
 Format the report in clear markdown with proper structure and include source references where appropriate.
 
 <Citation Rules>
-- Assign each unique URL a single citation number in your text
-- End with ### Sources that lists each source with corresponding numbers
-- IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
-- Each source should be a separate line item in a list, so that in markdown it is rendered as a list.
-- Example format:
-  [1] Source Title: URL
-  [2] Source Title: URL
-- Citations are extremely important. Make sure to include these, and pay a lot of attention to getting these right. Users will often use these citations to look into more information.
+For each claim with a source, generate a text-fragment link using RANGE MATCHING to highlight the ENTIRE source sentence in the original document. This enables one-click verification of claims.
+
+**Format: [number](url#:~:text=start_words,end_words)**
+
+**Goal: Highlight the complete source sentence using range matching.**
+- Start: First ~5 words of the source sentence
+- End: Last ~5 words of the source sentence
+- Result: The entire sentence gets highlighted when the link is clicked
+
+**How to construct the link:**
+1. Take the source sentence you want to cite
+2. Extract its FIRST ~5 words → this becomes the start anchor
+3. Extract its LAST ~5 words → this becomes the end anchor
+4. URL-encode both and combine: `text=first%20five%20words,last%20five%20words`
+
+**URL Encoding Rules (per WICG spec):**
+Only these characters MUST be percent-encoded:
+- Space → `%20`
+- `&` → `%26`
+- `-` → `%2D`  
+- `,` → `%2C`
+- Non-ASCII: UTF-8 encode, then percent-encode each byte
+
+Characters that do NOT need encoding: `= # ? : ! $ ' ( ) * + . / ; @ _ ~`
+
+**Example:**
+
+Source sentence to highlight: "A multi-agent system consists of multiple specialized agents working together under the coordination of an Orchestrator Agent. This approach enables complex workflows by distributing tasks among agents with distinct roles."
+
+Step 1 - First ~5 words: "A multi-agent system consists of"
+Step 2 - Last ~5 words: "among agents with distinct roles"
+Step 3 - URL-encode and combine:
+`[1](https://huggingface.co/learn/agents-course/en/unit2/smolagents/multi_agent_systems#:~:text=A%20multi-agent%20system%20consists%20of,among%20agents%20with%20distinct%20roles)`
+
+When clicked, this highlights the ENTIRE passage from "A multi-agent system consists of" through "...among agents with distinct roles."
+
+**More examples:**
+- Sentence: "AgentVerse is designed to facilitate the deployment of multiple LLM-based agents in various applications, which primarily provides two frameworks: task-solving and simulation."
+  `[2](https://github.com/OpenBMB/AgentVerse#:~:text=AgentVerse%20is%20designed%20to%20facilitate,task-solving%20and%20simulation)`
+
+- Sentence: "As part of our Sonnet 4.5 launch, we released a memory tool that allows agents to store information without keeping everything in context."
+  `[3](https://anthropic.com/engineering/effective-context-engineering-for-ai-agents#:~:text=As%20part%20of%20our%20Sonnet,without%20keeping%20everything%20in%20context)`
+
+Fallback: If encoding is uncertain or the sentence is very short (<10 words), use the regular URL: [1](https://example.com/article)
+
+**Sources Section Format:**
+- End with ### Sources listing each source with sequential numbers (1,2,3,4...)
+- Format: [1] Source Title: URL
 </Citation Rules>
 """
 
@@ -516,70 +627,174 @@ Make sure the final answer report is in the SAME language as the human messages 
 Format the report in clear markdown with proper structure and include source references where appropriate.
 
 <Citation Rules>
-- Assign each unique URL a single citation number in your text
-- End with ### Sources that lists each source with corresponding numbers
-- IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
-- Each source should be a separate line item in a list, so that in markdown it is rendered as a list.
-- Example format:
-  [1] Source Title: URL
-  [2] Source Title: URL
-- Citations are extremely important. Make sure to include these, and pay a lot of attention to getting these right. Users will often use these citations to look into more information.
+For each claim with a source, generate a text-fragment link using RANGE MATCHING to highlight the ENTIRE source sentence in the original document. This enables one-click verification of claims.
+
+**Format: [number](url#:~:text=start_words,end_words)**
+
+**Goal: Highlight the complete source sentence using range matching.**
+
+The research findings include exact source sentences. Use these to create range-matched links:
+1. Find the source sentence in the findings
+2. Take the FIRST ~5 words of the sentence → start anchor
+3. Take the LAST ~5 words of the sentence → end anchor
+4. URL-encode and combine: `text=first%20five%20words,last%20five%20words`
+5. When clicked, the ENTIRE sentence from start to end gets highlighted
+
+**URL Encoding Rules (per WICG spec):**
+Only these characters MUST be percent-encoded:
+- Space → `%20`
+- `&` → `%26`
+- `-` → `%2D`
+- `,` → `%2C`
+- Non-ASCII: UTF-8 encode, then percent-encode each byte
+
+Characters that do NOT need encoding: `= # ? : ! $ ' ( ) * + . / ; @ _ ~`
+
+**Example:**
+
+Source sentence to highlight: "A multi-agent system consists of multiple specialized agents working together under the coordination of an Orchestrator Agent. This approach enables complex workflows by distributing tasks among agents with distinct roles."
+
+Step 1 - First ~5 words: "A multi-agent system consists of"
+Step 2 - Last ~5 words: "among agents with distinct roles"
+Step 3 - URL-encode and combine:
+`[1](https://huggingface.co/learn/agents-course/en/unit2/smolagents/multi_agent_systems#:~:text=A%20multi-agent%20system%20consists%20of,among%20agents%20with%20distinct%20roles)`
+
+When clicked, this highlights the ENTIRE passage.
+
+**More examples:**
+- Sentence: "AgentVerse is designed to facilitate the deployment of multiple LLM-based agents in various applications, which primarily provides two frameworks: task-solving and simulation."
+  `[2](https://github.com/OpenBMB/AgentVerse#:~:text=AgentVerse%20is%20designed%20to%20facilitate,task-solving%20and%20simulation)`
+
+- Sentence: "As part of our Sonnet 4.5 launch, we released a memory tool that allows agents to store information without keeping everything in context."
+  `[3](https://anthropic.com/engineering/effective-context-engineering-for-ai-agents#:~:text=As%20part%20of%20our%20Sonnet,without%20keeping%20everything%20in%20context)`
+
+Fallback: If encoding is uncertain or the sentence is very short (<10 words), use the regular URL: [1](https://example.com/article)
+
+**Sources Section Format:**
+- End with ### Sources listing each source with sequential numbers (1,2,3,4...)
+- Format: [1] Source Title: URL
 </Citation Rules>
 """
 
-summarize_webpage_prompt = """You are tasked with summarizing the raw content of a webpage retrieved from a web search. Your goal is to create a summary that preserves the most important information from the original web page. This summary will be used by a downstream research agent, so it's crucial to maintain the key details without losing essential information.
+summarize_webpage_prompt = """You are tasked with extracting structured information from a webpage retrieved from a web search. Your goal is to create a comprehensive summary AND extract atomic claim-source pairs for the most important key facts.
 
-Here is the raw content of the webpage:
+<Webpage URL>
+{url}
+</Webpage URL>
 
-<webpage_content>
+<Webpage Content>
 {webpage_content}
-</webpage_content>
+</Webpage Content>
 
-Please follow these guidelines to create your summary:
+Today's date is {date}.
 
+<Task>
+You must produce two outputs:
+1. A comprehensive summary of the webpage covering all relevant information
+2. A SELECTIVE list of 5-10 atomic claim-source pairs for the most important key facts
+</Task>
+
+<Summary Guidelines>
 1. Identify and preserve the main topic or purpose of the webpage.
 2. Retain key facts, statistics, and data points that are central to the content's message.
-3. Keep important quotes from credible sources or experts.
-4. Maintain the chronological order of events if the content is time-sensitive or historical.
-5. Preserve any lists or step-by-step instructions if present.
-6. Include relevant dates, names, and locations that are crucial to understanding the content.
-7. Summarize lengthy explanations while keeping the core message intact.
+3. Maintain the chronological order of events if the content is time-sensitive or historical.
+4. Include relevant dates, names, and locations that are crucial to understanding the content.
+5. Aim for 25-30% of the original length while preserving all essential information.
 
-When handling different types of content:
+Content-specific focus:
+- News articles: Who, what, when, where, why, and how
+- Scientific content: Methodology, results, and conclusions
+- Opinion pieces: Main arguments and supporting points
+- Product pages: Key features, specifications, and unique selling points
+</Summary Guidelines>
 
-- For news articles: Focus on the who, what, when, where, why, and how.
-- For scientific content: Preserve methodology, results, and conclusions.
-- For opinion pieces: Maintain the main arguments and supporting points.
-- For product pages: Keep key features, specifications, and unique selling points.
+<Claim-Source Pair Extraction Rules>
+CRITICAL: The `claim` and `source_sentence` fields serve DIFFERENT purposes and must NEVER be identical.
 
-Your summary should be significantly shorter than the original content but comprehensive enough to stand alone as a source of information. Aim for about 25-30 percent of the original length, unless the content is already concise.
+**What is a CLAIM?**
+A claim is YOUR atomic distillation of a key fact - a concise, first-principles statement that captures the essence of the information. Think of it as how you would summarize the fact in 10-25 words for a bullet point.
 
-Present your summary in the following format:
+**What is a SOURCE_SENTENCE?**
+The source_sentence is the EXACT verbatim text from the webpage that proves the claim. This is the evidence - copied word-for-word.
 
-```
-{{
-   "summary": "Your summary here, structured with appropriate paragraphs or bullet points as needed",
-   "key_excerpts": "First important quote or excerpt, Second important quote or excerpt, Third important quote or excerpt, ...Add more excerpts as needed, up to a maximum of 5"
-}}
-```
+**First-Principles Thinking for Claims:**
+Break down information to its most fundamental, irreducible facts:
+- Strip away unnecessary context and qualifiers
+- Focus on the core assertion
+- Use clear, direct language
+- One fact per claim (no "and" or "while" connecting multiple facts)
 
-Here are two examples of good summaries:
+**Flexible Word Limit (10-25 words):**
+Adjust claim length based on the complexity of the fact:
+- Simple facts (numbers, dates, names): 10-15 words
+- Moderate complexity (findings, relationships): 15-20 words
+- Complex facts (multi-part data, nuanced findings): 20-25 words
 
-Example 1 (for a news article):
+**CRITICAL RULE: claim ≠ source_sentence**
+The claim MUST be a distilled, atomic version. The source_sentence MUST be the verbatim original. They should NEVER be identical or near-identical.
+
+**Quick Reference Examples:**
+| Pattern |    Wrong |    Correct|
+|---------|----------|-----------|
+| Copying source | claim: "Global sea levels have risen by 8-9 inches since 1880" | claim: "Sea levels rose 8-9 inches since 1880, one-third in recent decades" |
+| Compound facts | claim: "Messi joined Barcelona at 13 and had growth hormone deficiency" | Split into two separate claims |
+| Verbose filler | claim: "The research study conducted by scientists found..." | claim: "MIT study: treatment effective in 87% of cases" |
+
+**What to extract (5-10 pairs):** Primary findings, statistics, key dates/names, conclusions, unique insights
+**What NOT to extract:** Background info, common knowledge, minor details, unsupported opinions
+</Claim-Source Pair Extraction Rules>
+
+<Output Format>
+Respond with valid JSON in this exact structure:
 ```json
 {{
-   "summary": "On July 15, 2023, NASA successfully launched the Artemis II mission from Kennedy Space Center. This marks the first crewed mission to the Moon since Apollo 17 in 1972. The four-person crew, led by Commander Jane Smith, will orbit the Moon for 10 days before returning to Earth. This mission is a crucial step in NASA's plans to establish a permanent human presence on the Moon by 2030.",
-   "key_excerpts": "Artemis II represents a new era in space exploration, said NASA Administrator John Doe. The mission will test critical systems for future long-duration stays on the Moon, explained Lead Engineer Sarah Johnson. We're not just going back to the Moon, we're going forward to the Moon, Commander Jane Smith stated during the pre-launch press conference."
+   "summary": "Your comprehensive summary...",
+   "claim_source_pairs": [
+      {{
+         "claim": "Atomic distilled fact (10-25 words based on complexity)",
+         "source_sentence": "The EXACT verbatim sentence from the webpage that proves this claim."
+      }}
+   ]
 }}
 ```
+</Output Format>
 
-Example 2 (for a scientific article):
+<Example Output>
+For a news article about a clinical trial:
 ```json
 {{
-   "summary": "A new study published in Nature Climate Change reveals that global sea levels are rising faster than previously thought. Researchers analyzed satellite data from 1993 to 2022 and found that the rate of sea-level rise has accelerated by 0.08 mm/year² over the past three decades. This acceleration is primarily attributed to melting ice sheets in Greenland and Antarctica. The study projects that if current trends continue, global sea levels could rise by up to 2 meters by 2100, posing significant risks to coastal communities worldwide.",
-   "key_excerpts": "Our findings indicate a clear acceleration in sea-level rise, which has significant implications for coastal planning and adaptation strategies, lead author Dr. Emily Brown stated. The rate of ice sheet melt in Greenland and Antarctica has tripled since the 1990s, the study reports. Without immediate and substantial reductions in greenhouse gas emissions, we are looking at potentially catastrophic sea-level rise by the end of this century, warned co-author Professor Michael Green."  
+   "summary": "A Phase 3 clinical trial conducted by Pfizer demonstrated that their new Alzheimer's drug, PF-7892, reduced cognitive decline by 35% compared to placebo over 18 months. The study enrolled 1,847 participants across 120 sites in North America and Europe. Side effects were generally mild, with headache (12%) and nausea (8%) being most common. The FDA is expected to review the drug for approval in Q2 2024. If approved, it would be the third disease-modifying Alzheimer's treatment available.",
+   "claim_source_pairs": [
+      {{
+         "claim": "PF-7892 reduced cognitive decline by 35%",
+         "source_sentence": "The experimental drug PF-7892 reduced cognitive decline by 35% compared to placebo over the 18-month study period."
+      }},
+      {{
+         "claim": "Trial enrolled 1,847 participants",
+         "source_sentence": "The Phase 3 study enrolled 1,847 participants with early-stage Alzheimer's disease across 120 clinical sites in North America and Europe."
+      }},
+      {{
+         "claim": "FDA review expected Q2 2024",
+         "source_sentence": "Pfizer plans to submit its Biologics License Application to the FDA by the end of 2023, with a decision expected in the second quarter of 2024."
+      }},
+      {{
+         "claim": "Headache affected 12% of participants",
+         "source_sentence": "The most common side effects were headache, occurring in 12% of participants, and nausea, reported by 8%."
+      }}
+   ]
 }}
 ```
+Notice: Each claim is atomic (10-25 words), distilled to the core fact, and DIFFERENT from the verbatim source sentence.
+</Example Output>
+
+<Validation Checklist>
+Before outputting, verify each claim-source pair:
+☐ Claim is 10-25 words (scaled to fact complexity: simple→10-15, moderate→15-20, complex→20-25)
+☐ Claim is atomic (one fact only, no compound statements)
+☐ Claim is NOT identical or near-identical to source_sentence
+☐ Source_sentence is copied EXACTLY from the webpage
+☐ Pair represents a key fact worth citing
+</Validation Checklist>
 
 Remember, your goal is to create a summary that can be easily understood and utilized by a downstream research agent while preserving the most critical information from the original webpage.
 
@@ -590,7 +805,8 @@ Today's date is {date}.
 ##########################
 # Context Summarization Prompt
 ##########################
-context_summarization_prompt = """<role>
+context_summarization_prompt = """
+<role>
 Context Extraction Assistant
 </role>
 
