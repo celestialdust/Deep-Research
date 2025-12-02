@@ -62,8 +62,15 @@ Deep Research offers extensive configuration options to customize the research p
   - Deployment name: `gsds-gpt-5` (default)
   - API Version: `2025-04-01-preview`
   - Token limit: 200,000 tokens
-- **Model Selection**: Configure different models for summarization, research, compression, and final report generation
+- **Model Selection**: Configure different models for summarization, research, compression, final report generation, citation checking, and PDF conversion
 - **Azure OpenAI Settings**: Customize endpoint, API version, and deployment names for each model
+
+#### Citation & PDF Configuration
+
+- **Citation Check Model** (default: azure_openai:o4-mini): Model for verifying citations match source text exactly
+- **Citation Check Model Max Tokens** (default: 16,000): Maximum output tokens for citation check model
+- **PDF Conversion Model** (default: azure_openai:o4-mini): Model for converting `<ref>` tags to text-fragment URLs
+- **PDF Conversion Model Max Tokens** (default: 16,000): Maximum output tokens for PDF conversion model
 
 #### Context Engineering Configuration
 
@@ -85,6 +92,8 @@ Deep Research Agent uses a sophisticated multi-agent architecture built on LangG
 - **Compression Agent**: Synthesizes and compresses research findings from multiple agents
 - **Draft Report Refiner**: Iteratively refines the draft report based on new research findings using the diffusion algorithm
 - **Report Generator**: Creates comprehensive final reports from all research findings with enhanced insightfulness and helpfulness criteria
+- **Citation Check Agent**: Verifies that all `<ref>` citations match research notes exactly, correcting paraphrased or hallucinated source sentences
+- **URL Conversion Agent**: Converts `<ref id="N">"source"</ref>` tags to text-fragment URLs using range matching for PDF generation
 
 ### Key Features
 
@@ -97,7 +106,7 @@ Deep Research Agent uses a sophisticated multi-agent architecture built on LangG
 - **Enhanced Quality Criteria**: Final reports follow strict insightfulness (granular breakdowns, detailed tables, nuanced discussion) and helpfulness (satisfying intent, clarity, accuracy) rules
 - **Context Engineering**: Automatic context window summarization using o4-mini when approaching token limits, mirroring LangChain v1's `SummarizationMiddleware`
 - **Research Validation**: Notes and raw notes are asynchronously saved to `/docs` before final report generation for resource validation (non-blocking I/O)
-- **Retraceable Citations**: Text-fragment links enable one-click navigation to the exact source sentence supporting each claim (see [Citations](#retraceable-citations))
+- **Retraceable Citations**: Text-fragment links using range matching enable one-click navigation to the exact source sentence, with robust URL utilities and PDF-compatible short URLs (see [Citations](#retraceable-citations))
 - **PDF Export**: Automatic conversion of final reports to professional PDF format with serif fonts and proper margins (see [PDF Export](#pdf-export))
 
 ## Project Structure
@@ -137,6 +146,8 @@ deep_research_openai/
   - Human-in-the-loop configuration
   - Search enablement for brief and draft nodes
   - Context summarization settings (token threshold, messages to keep, summarization model)
+  - Citation check model settings (for verifying citations against research notes)
+  - PDF conversion model settings (for converting refs to text-fragment URLs)
   - MCP configuration
   - Azure OpenAI settings with separate deployment configurations
   - Supports both environment variables and UI configuration
@@ -145,16 +156,18 @@ deep_research_openai/
   - User clarification
   - Research brief generation (with optional Tavily search)
   - Human-in-the-loop research brief approval
-  - Draft report generation (with optional Tavily search and text-fragment citations)
+  - Draft report generation (with optional Tavily search and `<ref>` citations)
   - Research supervisor (with diffusion algorithm and context summarization)
   - Parallel research execution (with context summarization)
   - Research compression (with exact source sentence preservation)
   - Draft report refinement
-  - Final report generation (with text-fragment citations and async note-saving to `/docs`)
+  - Final report generation (with `<ref>` inline citations and async note-saving to `/docs`)
+  - Citation check (verifies citations match research notes exactly using `create_agent`)
+  - URL conversion (converts `<ref>` tags to text-fragment URLs for PDF)
   - PDF conversion (markdown → HTML → PDF with WeasyPrint)
 
 - **`state.py`**: Defines all state classes and data models:
-  - `AgentState`: Main workflow state (includes `draft_report`, `brief_refinement_rounds`, `pdf_path`, `pdf_generation_status` fields)
+  - `AgentState`: Main workflow state (includes `draft_report`, `brief_refinement_rounds`, `pdf_path`, `final_report_pdf` fields)
   - `SupervisorState`: Research supervisor state (includes `draft_report` field)
   - `ResearcherState`: Individual researcher state
   - `ClaimSourcePair`: Atomic claim with exact source sentence for text-fragment citations (claim + source_sentence fields)
@@ -165,11 +178,22 @@ deep_research_openai/
 - **`utils.py`**: Utility functions including:
   - `MessageSummarizer`: Context window summarization class (mirrors LangChain v1's `SummarizationMiddleware`)
   - `think_tool`: Strategic reflection tool for research planning
+  - `citation_think_tool`: Analysis tool for verifying citation accuracy against research notes
   - `refine_draft_report`: Tool for iteratively refining the draft report
   - `tavily_search`: Tavily search tool for research brief and draft generation
   - `summarize_webpage`: Webpage summarization with atomic claim-source pair extraction (with automatic retry on token limits)
   - PDF generation utilities: `generate_pdf_from_markdown`, `save_markdown_file`, `extract_title_from_markdown`, `sanitize_filename`
   - `PDF_CSS_STYLES`: Professional CSS styling for PDF reports
+  - URL utilities with robust fallback handling:
+    - `create_citation_link`: One-step citation link from URL + source sentence
+    - `create_text_fragment_url`: Create range-matched text fragment URLs
+    - `validate_url`: Validate and sanitize URLs with automatic https:// prefix
+    - `normalize_url`: Clean up common URL issues (double slashes, trailing hashes)
+    - `extract_text_fragment`: Parse text fragment components from URLs
+    - `sanitize_anchor_text`: Clean anchor text, remove problematic chars
+    - `get_anchor_from_sentence`: Extract optimal start/end anchors with capital-letter detection
+    - `encode_text_fragment_anchor` / `decode_text_fragment_anchor`: URL encoding/decoding
+    - `has_problematic_chars`: Check for characters that break URLs/PDFs
   - MCP tool loading and authentication
   - Search API integration (Tavily, OpenAI, Anthropic)
   - Model configuration builders with GPT-5 support
@@ -179,12 +203,14 @@ deep_research_openai/
   - Research clarification
   - Research brief generation (with optional search tool instructions)
   - Research planning with diffusion algorithm
-  - Draft report generation (with text-fragment citation guidelines)
+  - Draft report generation (with `<ref id="N">"source"</ref>` citation format)
   - Research execution with strategic reflection
   - Webpage summarization with atomic claim-source pair extraction (every key claim must be backed by a source sentence)
   - Content summarization and compression (with exact source sentence preservation)
   - Draft report refinement
-  - Final report generation (with text-fragment citations, insightfulness/helpfulness criteria, and multi-language support)
+  - Final report generation (with `<ref>` inline citations and Sources section rules)
+  - Citation verification (for checking citations against research notes)
+  - URL conversion (for converting refs to text-fragment URLs)
 
 #### `src/security/`
 
@@ -261,9 +287,11 @@ The `MessageSummarizer` class provides automatic context window management by su
 
 ### Research Notes Persistence
 
-Before final report generation, research notes are asynchronously saved to `/docs` for validation using non-blocking I/O operations:
+Research notes are asynchronously saved to `/docs` **after successful final report generation** to prevent duplicate files during retries:
 - `docs/notes_{timestamp}.md` - Compressed research findings
 - `docs/raw_notes_{timestamp}.md` - Raw tool outputs and AI responses
+
+**Why after generation?** If notes were saved before the LLM call, LangGraph retries (e.g., due to cancellation or timeout) would create duplicate files with different timestamps.
 
 All file operations use `asyncio.to_thread()` to prevent blocking the ASGI event loop, ensuring optimal performance in production deployments.
 
@@ -287,60 +315,131 @@ Deep Research generates citations with text-fragment links that navigate directl
 
 2. **Compression Agent**: Research findings are compressed while preserving exact source sentences for each citation. The URL context is provided in the source header for each webpage.
 
-3. **Report Generation**: Draft and final reports generate text-fragment links using the format:
-   ```
-   [number](url#:~:text=encoded_sentence)
-   ```
+3. **Report Generation**: Draft and final reports generate text-fragment links using **range matching** format for reliable PDF rendering.
 
-### Citation Format
+### Text Fragment Format (Range Matching)
 
-**In-text citations**:
-```markdown
-AI adoption increased significantly [1](https://example.com/article#:~:text=AI%20adoption%20increased%2050%25%20in%202024)
+Deep Research uses **range matching** to create short, reliable URLs that work in PDFs:
+
+```
+#:~:text=START_ANCHOR,END_ANCHOR
+        ↑ first 3-5 words    ↑ last 3-5 words
+                   ↑ comma separator (required)
 ```
 
-**Sources section**:
+**Why Range Matching:**
+- Short URLs (under 100 chars) render correctly in PDFs
+- Highlights the full sentence when clicked
+- More reliable than encoding entire sentences
+
+**Example:**
+Source sentence: "Targeted therapies have reshaped the management of relapsed CLL."
+
 ```markdown
+[1](https://example.com/article#:~:text=Targeted%20therapies%20have%20reshaped,management%20of%20relapsed%20CLL)
+```
+
+When clicked, this highlights the entire sentence.
+
+### Dual-Format Citation System
+
+Deep Research generates two citation formats:
+
+**1. Markdown Output (for UI)** - Uses `<ref>` tags with verbatim source sentences:
+```markdown
+Targeted therapies changed treatment. <ref id="1">"Targeted therapies have reshaped the management of relapsed CLL."</ref>
+
 ### Sources
 [1] Article Title: https://example.com/article
 [2] Study Name: https://example.com/study
 ```
 
-### Text Fragment Format (Range Matching)
-
-Deep Research uses **range matching** to highlight the ENTIRE source sentence:
-
-```
-#:~:text=first%20five%20words,last%20five%20words
+**2. PDF Output** - `<ref>` tags are converted to text-fragment URLs:
+```markdown
+Targeted therapies changed treatment [1](https://example.com/article#:~:text=Targeted%20therapies%20have%20reshaped,management%20of%20relapsed%20CLL)
 ```
 
-- **Start anchor**: First ~5 words of the source sentence
-- **End anchor**: Last ~5 words of the source sentence
-- **Result**: The complete sentence gets highlighted when clicked
+**Why this approach:**
+- `<ref>` format preserves exact source text for verification
+- Citation check agent can verify quotes against research notes
+- Downstream URL conversion creates clickable links for PDF
+- Prevents hallucinated or paraphrased citations
 
-**Example:**
-Source sentence: "As part of our Sonnet 4.5 launch, we released a memory tool that allows agents to store information without keeping everything in context."
+### Anchor Selection Rules
 
-```
-https://anthropic.com/blog#:~:text=As%20part%20of%20our%20Sonnet,without%20keeping%20everything%20in%20context
-```
+- **START**: 3-5 words, must begin with capital letter
+- **END**: 3-5 words, must end with complete word (not comma or parenthesis)
+- **AVOID**: commas, brackets, parentheses, quotes, percent signs in selected text
+- **Short sentences** (under 10 words): use 2-3 words for each anchor
 
-When clicked, this highlights the entire sentence from "As part of our Sonnet..." through "...without keeping everything in context."
+### URL Encoding Rules
 
-### URL Encoding Rules (per WICG Spec)
-
-Only these characters MUST be percent-encoded:
+**Minimal encoding** - only encode spaces:
 - Space → `%20`
-- `&` → `%26`
-- `-` → `%2D`
-- `,` → `%2C`
-- Non-ASCII: UTF-8 encode, then percent-encode
 
-Characters that do NOT need encoding: `= # ? : ! $ ' ( ) * + . / ; @ _ ~`
+**Avoid selecting text with:**
+- Commas (would encode to `%2C`)
+- Brackets (would encode to `%5B` `%5D`)
+- Percent signs (would encode to `%25`)
+
+### URL Utilities
+
+The `utils.py` module provides robust URL handling with comprehensive fallback:
+
+```python
+from deep_research.utils import (
+    create_text_fragment_url,    # Create range-matched text fragment URLs
+    create_citation_link,        # One-step citation link from URL + sentence
+    validate_url,                # Validate and sanitize URLs
+    normalize_url,               # Clean up common URL issues
+    extract_text_fragment,       # Parse text fragment from URL
+    sanitize_anchor_text,        # Clean anchor text for URL encoding
+    get_anchor_from_sentence,    # Extract start/end anchors from sentence
+    encode_text_fragment_anchor, # Encode text for URL fragment
+    decode_text_fragment_anchor, # Decode URL fragment to text
+    has_problematic_chars        # Check for chars that break URLs/PDFs
+)
+
+# Create a citation link from URL and source sentence (recommended)
+url = create_citation_link(
+    base_url="https://example.com/article",
+    source_sentence="Targeted therapies have reshaped the management of relapsed CLL."
+)
+# Returns: https://example.com/article#:~:text=Targeted%20therapies%20have%20reshaped,management%20of%20relapsed%20CLL
+
+# Or manually create with specific anchors
+url = create_text_fragment_url(
+    base_url="https://example.com/article",
+    start_anchor="Targeted therapies have reshaped",
+    end_anchor="management of relapsed CLL"
+)
+
+# Validate and normalize URLs
+is_valid, result = validate_url("example.com/page")
+# is_valid: True, result: "https://example.com/page"
+
+# Extract anchors from a sentence
+start = get_anchor_from_sentence("The study enrolled 1847 participants.", position="start")
+end = get_anchor_from_sentence("The study enrolled 1847 participants.", position="end")
+# start: "The study enrolled 1847"
+# end: "enrolled 1847 participants"
+```
+
+**Robustness Features:**
+- Automatic URL scheme detection and addition (`https://`)
+- URL normalization (removes double slashes, trailing hashes)
+- Anchor length limits (max 100 chars for PDF compatibility)
+- Automatic fallback to plain URL if fragment creation fails
+- Detection of problematic characters (commas, brackets, etc.)
+- Smart anchor extraction that finds capital-letter starts
+- Handles short sentences with fewer anchor words
 
 ### Fallback Behavior
 
-If text-fragment generation fails (encoding error, sentence unavailable), the system falls back to regular URLs without fragments.
+If text-fragment generation fails, the system falls back to plain URLs:
+- Sentence has many special characters → plain URL
+- URL would exceed 100 characters → plain URL
+- Encoding error → plain URL
 
 **Reference**: [WICG Scroll-to-Text Fragment Spec](https://wicg.github.io/scroll-to-text-fragment/)
 
@@ -385,14 +484,21 @@ apt-get install libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 
 
 The `AgentState` includes PDF-related fields:
 - `pdf_path`: Path to the generated PDF file (or markdown fallback)
-- `pdf_generation_status`: Status indicator (`"pending"`, `"success"`, `"failed"`)
+- `md_path`: Path to the markdown file with text-fragment URLs
+- `final_report_pdf`: The report content with `<ref>` tags converted to text-fragment URLs (string)
 
 ### Workflow Integration
 
-The PDF conversion node runs after final report generation:
+The PDF generation pipeline runs after final report generation with citation verification:
 ```
-final_report_generation → convert_to_pdf → END
+final_report_generation → check_citations → convert_refs_to_urls → convert_to_pdf → END
 ```
+
+**Pipeline stages:**
+1. **final_report_generation**: Generates report with `<ref id="N">"source sentence"</ref>` inline citations
+2. **check_citations**: Verifies each ref's source sentence matches research notes exactly (uses `citation_think_tool`)
+3. **convert_refs_to_urls**: LLM converts `<ref>` tags to text-fragment URL links using range matching
+4. **convert_to_pdf**: Generates PDF from URL-converted markdown, adds report to UI messages
 
 ## Future Developments
 
@@ -404,6 +510,7 @@ final_report_generation → convert_to_pdf → END
 - ~~Apply Context Engineering practices~~ (Completed)
 - ~~Retraceable Citations with Text-Fragment Links~~ (Completed)
 - ~~PDF Export for Professional Reports~~ (Completed)
+- ~~Citation Verification Agent~~ (Completed)
 - Integrate domain specific insights from feedbacks
 
 ### Product/UX

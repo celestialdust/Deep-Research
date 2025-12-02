@@ -23,7 +23,6 @@ from .state import Summary, ResearchComplete
 from .configuration import SearchAPI, Configuration
 from .prompts import summarize_webpage_prompt, report_generation_with_draft_insight_prompt, context_summarization_prompt
 
-
 ##########################
 # Context Summarization
 ##########################
@@ -916,6 +915,41 @@ def think_tool(reflection: str) -> str:
     """
     return f"Reflection recorded: {reflection}"
 
+
+@tool
+def citation_think_tool(analysis: str) -> str:
+    """Tool for analyzing citation accuracy and planning corrections.
+    
+    Use this tool to systematically verify each citation in the report against research notes.
+    This creates a deliberate analysis step before making any corrections.
+    
+    When to use:
+    - Before verifying a citation: Record the ref ID and quoted sentence
+    - During comparison: Note whether the quote matches the notes exactly
+    - When finding corrections: Record the exact verbatim sentence from notes
+    - After analysis: Plan the specific correction to make
+    
+    Analysis should address:
+    1. Citation identification - Which ref ID and what quoted sentence?
+    2. Verification status - Does the quote exist VERBATIM in research notes?
+    3. Source matching - Is the quote attributed to the correct source ID?
+    4. Correction plan - If not exact match, what is the correct verbatim sentence?
+    
+    Example analysis:
+    "Checking ref id=1: 'PFS improved significantly.' 
+     - Found in notes: 'The 36-month PFS was 65.4% in the zanubrutinib group.'
+     - Status: PARAPHRASED - quote is not verbatim
+     - Correction: Replace with exact sentence from notes"
+    
+    Args:
+        analysis: Detailed analysis of citation accuracy, source verification, and planned corrections
+        
+    Returns:
+        Confirmation that citation analysis was recorded
+    """
+    return f"Citation analysis recorded: {analysis}"
+
+
 @tool
 def refine_draft_report(
     research_brief: Annotated[str, InjectedToolArg],
@@ -1055,22 +1089,8 @@ a:hover {
     width: 5px;
 }
 
-/* Disable URL expansion for citation links in print */
-@media print {
-    .citation a:after {
-        content: none !important;
-    }
-}
-
-/* Print-friendly links - show URL after link text (exclude citations) */
-@media print {
-    a[href^="http"]:not(.citation a):after {
-        content: " (" attr(href) ")";
-        font-size: 9pt;
-        color: #666;
-        word-break: break-all;
-    }
-}
+/* PDF links are clickable - no need to show URLs after link text */
+/* Links remain clickable in the generated PDF */
 
 table {
     width: 100%;
@@ -1149,10 +1169,11 @@ def convert_citations_to_superscript(html_content: str) -> str:
     """
     import re
     
-    # Pattern to match citation links: <a href="...">number</a>
-    # where number is 1-3 digits, optionally with comma-separated numbers
+    # Pattern to match citation links: <a href="...">citation</a>
+    # where citation is 1-3 digits optionally followed by a letter (e.g., "1", "2a", "13b")
+    # Also handles comma-separated citations like "1, 2, 3" or "2a, 2b"
     citation_pattern = re.compile(
-        r'<a\s+href="([^"]+)"[^>]*>(\d{1,3}(?:\s*,\s*\d{1,3})*)</a>',
+        r'<a\s+href="([^"]+)"[^>]*>(\d{1,3}[a-zA-Z]?(?:\s*,\s*\d{1,3}[a-zA-Z]?)*)</a>',
         re.IGNORECASE
     )
     
@@ -1238,6 +1259,16 @@ async def generate_pdf_from_markdown(
     """
     try:
         import markdown
+        import sys
+        
+        # macOS: Configure library path for WeasyPrint's native dependencies (Pango, HarfBuzz, etc.)
+        # These are installed via Homebrew but Python needs to know where to find them
+        if sys.platform == 'darwin':
+            homebrew_lib = '/opt/homebrew/lib'
+            current_path = os.environ.get('DYLD_FALLBACK_LIBRARY_PATH', '')
+            if homebrew_lib not in current_path:
+                os.environ['DYLD_FALLBACK_LIBRARY_PATH'] = f"{homebrew_lib}:{current_path}" if current_path else homebrew_lib
+        
         from weasyprint import HTML, CSS
         
         # Convert markdown to HTML

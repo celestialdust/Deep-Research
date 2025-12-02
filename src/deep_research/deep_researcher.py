@@ -30,7 +30,9 @@ from .prompts import (
     compress_research_system_prompt,
     compress_research_simple_human_message,
     final_report_generation_prompt,
-    lead_researcher_prompt
+    lead_researcher_prompt,
+    citation_check_prompt,
+    convert_refs_to_urls_prompt
 )
 from .utils import (
     get_today_str,
@@ -44,6 +46,7 @@ from .utils import (
     get_notes_from_tool_calls,
     build_model_config,
     think_tool,
+    citation_think_tool,
     refine_draft_report,
     tavily_search,
     MessageSummarizer,
@@ -256,20 +259,29 @@ async def write_draft_report(state: AgentState, config: RunnableConfig) -> Comma
         
         # If there are tool calls, execute them (max 1 iteration)
         if initial_response.tool_calls:
-            tool_call = initial_response.tool_calls[0]  # Only execute first tool call
-            tool_result = await tavily_search.ainvoke(tool_call["args"], config)
+            # Execute only the first tool call for search, but create responses for ALL
+            tool_results = []
+            raw_notes_parts = [str(initial_response.content) if initial_response.content else ""]
             
-            # Format raw notes like research agents do
-            raw_notes_content = "\n".join([
-                str(initial_response.content) if initial_response.content else "",
-                str(tool_result)
-            ])
+            for i, tool_call in enumerate(initial_response.tool_calls):
+                if i == 0:
+                    # Actually execute the first search
+                    tool_result = await tavily_search.ainvoke(tool_call["args"], config)
+                    raw_notes_parts.append(str(tool_result))
+                else:
+                    # For additional tool calls, provide a placeholder response
+                    # This satisfies OpenAI's requirement that all tool_calls have responses
+                    tool_result = "Search skipped - only one search allowed per draft generation."
+                
+                tool_results.append(
+                    ToolMessage(content=tool_result, name=tool_call["name"], tool_call_id=tool_call["id"])
+                )
             
-            # Add tool message and get structured output
-            messages_with_tool = initial_messages + [
-                initial_response,
-                ToolMessage(content=tool_result, name=tool_call["name"], tool_call_id=tool_call["id"])
-            ]
+            # Format raw notes
+            raw_notes_content = "\n".join(raw_notes_parts)
+            
+            # Add all tool messages to satisfy OpenAI API requirement
+            messages_with_tool = initial_messages + [initial_response] + tool_results
             
             # Now get structured output
             draft_model_structured = configurable_model.with_structured_output(DraftReport).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(draft_model_config)
@@ -601,7 +613,8 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
         config
     )
     
-    # Save notes and raw_notes to /docs for resource validation BEFORE LLM call
+    # Helper function to save notes AFTER successful report generation
+    # This prevents duplicate saves when LangGraph retries the node
     async def save_notes_async():
         """Save notes to files using async operations to avoid blocking."""
         def write_file(path: str, content: str):
@@ -627,11 +640,6 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
             await asyncio.to_thread(write_file, raw_notes_path, content)
             print(f"Raw notes saved to: {raw_notes_path}")
     
-    try:
-        await save_notes_async()
-    except Exception as e:
-        print(f"Warning: Failed to save notes to /docs: {e}")
-    
     findings = "\n".join(notes)
     max_retries = 3
     current_retry = 0
@@ -644,6 +652,13 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
         )
         try:
             final_report = await configurable_model.with_config(writer_model_config).ainvoke([HumanMessage(content=final_report_prompt)])
+            
+            # Save notes AFTER successful report generation (prevents duplicates on retry)
+            try:
+                await save_notes_async()
+            except Exception as e:
+                print(f"Warning: Failed to save notes to /docs: {e}")
+            
             return {
                 "final_report": final_report.content, 
                 "messages": [final_report],
@@ -677,27 +692,141 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     }
 
 
-async def convert_to_pdf(state: AgentState, config: RunnableConfig):
-    """Convert the final report from markdown to PDF.
+async def check_citations(state: AgentState, config: RunnableConfig):
+    """Verify that all <ref> citations match research notes exactly.
     
-    Uses WeasyPrint to convert markdown → HTML → PDF with professional styling.
-    On failure, saves markdown as fallback and continues workflow.
+    Uses citation_think_tool to analyze each citation and correct any
+    paraphrased or hallucinated source sentences.
+    
+    Args:
+        state: Current agent state containing final_report and notes
+        config: Runtime configuration
+        
+    Returns:
+        Dictionary with corrected final_report
+    """
+    from langchain.agents import create_agent
+    
+    configurable = Configuration.from_runnable_config(config)
+    
+    # Build model config for citation check
+    citation_model_config = build_model_config(
+        configurable.citation_check_model,
+        configurable.citation_check_model_max_tokens,
+        config
+    )
+    
+    final_report = state.get("final_report", "")
+    notes = state.get("notes", [])
+    
+    # If no report or no notes, skip checking
+    if not final_report or not notes:
+        return {"final_report": final_report}
+    
+    # Combine notes for context
+    notes_combined = "\n\n---\n\n".join(notes)
+    
+    # Format the prompt
+    check_prompt = citation_check_prompt.format(
+        notes=notes_combined,
+        report=final_report
+    )
+    
+    # Create agent with citation_think_tool using new LangChain v1 API
+    citation_agent = create_agent(
+        model=configurable_model.with_config(citation_model_config),
+        tools=[citation_think_tool],
+        system_prompt=check_prompt
+    )
+    
+    try:
+        # Run the citation check agent
+        result = await citation_agent.ainvoke({"messages": [HumanMessage(content="Please verify and correct all citations in the report.")]})
+        
+        # Extract the corrected report from the last AI message
+        for msg in reversed(result.get("messages", [])):
+            if isinstance(msg, AIMessage) and msg.content:
+                corrected_report = msg.content
+                print("Citation check completed successfully")
+                return {"final_report": corrected_report}
+        
+        # If no corrected report found, return original
+        print("Citation check: No corrections made")
+        return {"final_report": final_report}
+        
+    except Exception as e:
+        print(f"Citation check failed: {e}")
+        # On error, return original report
+        return {"final_report": final_report}
+
+
+async def convert_refs_to_urls(state: AgentState, config: RunnableConfig):
+    """Convert <ref> tags to text-fragment URLs for PDF generation.
+    
+    Uses an LLM to convert <ref id="N">"source sentence"</ref> tags
+    to markdown links with text-fragment URLs in range format.
     
     Args:
         state: Current agent state containing final_report
         config: Runtime configuration
         
     Returns:
-        Dictionary with pdf_path and pdf_generation_status
+        Dictionary with final_report_pdf containing URL-converted content string
     """
+    configurable = Configuration.from_runnable_config(config)
     
+    # Build model config for PDF conversion
+    conversion_model_config = build_model_config(
+        configurable.pdf_conversion_model,
+        configurable.pdf_conversion_model_max_tokens,
+        config
+    )
     
     final_report = state.get("final_report", "")
     
     if not final_report:
+        return {"final_report_pdf": ""}
+    
+    # Format the conversion prompt
+    conversion_prompt = convert_refs_to_urls_prompt.format(report=final_report)
+    
+    try:
+        # Invoke the model to convert refs to URLs
+        result = await configurable_model.with_config(conversion_model_config).ainvoke([
+            HumanMessage(content=conversion_prompt)
+        ])
+        
+        converted_report = result.content if result.content else final_report
+        print("Ref to URL conversion completed successfully")
+        return {"final_report_pdf": converted_report}
+        
+    except Exception as e:
+        print(f"Ref to URL conversion failed: {e}")
+        # On error, use original report (refs won't be clickable but content preserved)
+        return {"final_report_pdf": final_report}
+
+
+async def convert_to_pdf(state: AgentState, config: RunnableConfig):
+    """Convert the final report from markdown to PDF.
+    
+    Uses WeasyPrint to convert markdown → HTML → PDF with professional styling.
+    Uses final_report_pdf (with text-fragment URLs) for PDF generation.
+    Adds markdown report to messages for UI display.
+    
+    Args:
+        state: Current agent state containing final_report and final_report_pdf
+        config: Runtime configuration
+        
+    Returns:
+        Dictionary with pdf_path, md_path, and messages
+    """
+    final_report = state.get("final_report", "")
+    # Use URL-converted version for PDF, fall back to original
+    pdf_ready_content = state.get("final_report_pdf", "") or final_report
+    
+    if not final_report:
         return {
-            "pdf_path": None,
-            "pdf_generation_status": "skipped"
+            "pdf_path": None
         }
     
     # Extract and sanitize title for filename
@@ -715,34 +844,46 @@ async def convert_to_pdf(state: AgentState, config: RunnableConfig):
         print(f"Warning: Failed to create docs directory: {e}")
         return {
             "pdf_path": None,
-            "pdf_generation_status": "failed"
+            "messages": [AIMessage(content=final_report)]
         }
     
     pdf_path = os.path.join(docs_dir, f"{sanitized_title}_{timestamp}.pdf")
-    md_fallback_path = os.path.join(docs_dir, f"{sanitized_title}_{timestamp}.md")
+    md_path = os.path.join(docs_dir, f"{sanitized_title}_{timestamp}.md")
     
-    pdf_success = await generate_pdf_from_markdown(final_report, pdf_path, title)
+    # Save markdown version with text-fragment URLs for reference
+    md_success = await save_markdown_file(pdf_ready_content, md_path)
+    if md_success:
+        print(f"Markdown saved to: {md_path}")
+    else:
+        print(f"Warning: Failed to save markdown file")
+    
+    # Generate PDF from URL-converted content
+    pdf_success = await generate_pdf_from_markdown(pdf_ready_content, pdf_path, title)
+    
+    # Create the final message with markdown report (appears in UI)
+    final_message = AIMessage(content=final_report)
     
     if pdf_success:
         print(f"PDF generated successfully: {pdf_path}")
         return {
             "pdf_path": pdf_path,
-            "pdf_generation_status": "success"
+            "md_path": md_path,
+            "messages": [final_message]
         }
     
-    # PDF generation failed - save markdown as fallback
-    md_success = await save_markdown_file(final_report, md_fallback_path)
-    
+    # PDF generation failed - markdown already saved above
     if md_success:
-        print(f"Markdown fallback saved to: {md_fallback_path}")
+        print(f"PDF generation failed, markdown available at: {md_path}")
         return {
-            "pdf_path": md_fallback_path,
-            "pdf_generation_status": "failed"
+            "pdf_path": None,
+            "md_path": md_path,
+            "messages": [final_message]
         }
     
     return {
         "pdf_path": None,
-        "pdf_generation_status": "failed"
+        "md_path": None,
+        "messages": [final_message]
     }
 
 
@@ -753,10 +894,14 @@ deep_researcher_builder.add_node("approve_research_brief", approve_research_brie
 deep_researcher_builder.add_node("write_draft_report", write_draft_report)
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)
+deep_researcher_builder.add_node("check_citations", check_citations)
+deep_researcher_builder.add_node("convert_refs_to_urls", convert_refs_to_urls)
 deep_researcher_builder.add_node("convert_to_pdf", convert_to_pdf)
 deep_researcher_builder.add_edge(START, "clarify_with_user")
 deep_researcher_builder.add_edge("research_supervisor", "final_report_generation")
-deep_researcher_builder.add_edge("final_report_generation", "convert_to_pdf")
+deep_researcher_builder.add_edge("final_report_generation", "check_citations")
+deep_researcher_builder.add_edge("check_citations", "convert_refs_to_urls")
+deep_researcher_builder.add_edge("convert_refs_to_urls", "convert_to_pdf")
 deep_researcher_builder.add_edge("convert_to_pdf", END)
 
 graph = deep_researcher_builder.compile(name = "deep_researcher")

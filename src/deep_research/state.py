@@ -79,9 +79,10 @@ class AgentState(MessagesState):
     notes: Annotated[list[str], override_reducer] = []
     draft_report: str
     final_report: str
+    final_report_pdf: str = ""  # Report with refs converted to text-fragment URLs for PDF generation
     brief_refinement_rounds: int = 0
     pdf_path: Optional[str] = None
-    pdf_generation_status: str = "pending"  # "pending", "success", "failed"
+    md_path: Optional[str] = None  # Markdown output for observing URL link patterns
 
 class SupervisorState(TypedDict):
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]

@@ -130,7 +130,7 @@ class Configuration(BaseModel):
         }
     )
     enable_search_for_brief: bool = Field(
-        default=True,
+        default=False,
         metadata={
             "x_oap_ui_config": {
                 "type": "boolean",
@@ -290,6 +290,50 @@ class Configuration(BaseModel):
                 "type": "number",
                 "default": 10000,
                 "description": "Maximum output tokens for final report model"
+            }
+        }
+    )
+    
+    # Citation Check Configuration
+    citation_check_model: str = Field(
+        default="azure_openai:o4-mini",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "azure_openai:o4-mini",
+                "description": "Model for verifying citations match source text exactly"
+            }
+        }
+    )
+    citation_check_model_max_tokens: int = Field(
+        default=16000,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 16000,
+                "description": "Maximum output tokens for citation check model"
+            }
+        }
+    )
+    
+    # PDF Conversion Configuration
+    pdf_conversion_model: str = Field(
+        default="azure_openai:o4-mini",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "azure_openai:o4-mini",
+                "description": "Model for converting ref tags to text-fragment URLs for PDF"
+            }
+        }
+    )
+    pdf_conversion_model_max_tokens: int = Field(
+        default=16000,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 16000,
+                "description": "Maximum output tokens for PDF conversion model"
             }
         }
     )
