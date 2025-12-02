@@ -660,8 +660,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 print(f"Warning: Failed to save notes to /docs: {e}")
             
             return {
-                "final_report": final_report.content, 
-                "messages": [final_report],
+                "final_report": final_report.content,
                 **cleared_state
             }
         except Exception as e:
@@ -687,7 +686,6 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 }
     return {
         "final_report": "Error generating final report: Maximum retries exceeded",
-        "messages": [final_report],
         **cleared_state
     }
 
