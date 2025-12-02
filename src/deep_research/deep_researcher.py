@@ -20,7 +20,10 @@ from .state import (
     DraftReport,
     ConductResearch,
     ResearchComplete,
-    ResearcherOutputState
+    ResearcherOutputState,
+    PostProcessingState,
+    PostProcessingInputState,
+    PostProcessingOutputState
 )
 from .prompts import (
     clarify_with_user_instructions,
@@ -191,7 +194,6 @@ async def approve_research_brief(state: AgentState, config: RunnableConfig) -> C
     # Call interrupt() - this pauses execution and returns the resume value
     decision = interrupt(interrupt_payload)
     
-    # Process the decision
     # Expected format: {"type": "approve"} or {"type": "reject", "feedback": "..."}
     if not isinstance(decision, dict):
         return Command(goto="write_draft_report")
@@ -605,7 +607,7 @@ researcher_subgraph = researcher_builder.compile()
 async def final_report_generation(state: AgentState, config: RunnableConfig):
     notes = state.get("notes", [])
     raw_notes = state.get("raw_notes", [])
-    cleared_state = {"notes": {"type": "override", "value": []},}
+    # Notes and messages will be cleared after citation check
     configurable = Configuration.from_runnable_config(config)
     writer_model_config = build_model_config(
         configurable.final_report_model,
@@ -614,7 +616,6 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     )
     
     # Helper function to save notes AFTER successful report generation
-    # This prevents duplicate saves when LangGraph retries the node
     async def save_notes_async():
         """Save notes to files using async operations to avoid blocking."""
         def write_file(path: str, content: str):
@@ -660,8 +661,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 print(f"Warning: Failed to save notes to /docs: {e}")
             
             return {
-                "final_report": final_report.content,
-                **cleared_state
+                "final_report": final_report.content
             }
         except Exception as e:
             if is_token_limit_exceeded(e, configurable.final_report_model):
@@ -669,8 +669,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                     model_token_limit = get_model_token_limit(configurable.final_report_model)
                     if not model_token_limit:
                         return {
-                            "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}",
-                            **cleared_state
+                            "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}"
                         }
                     findings_token_limit = model_token_limit * 4
                 else:
@@ -681,29 +680,34 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
             else:
                 # If not a token limit exceeded error, then we just throw an error.
                 return {
-                    "final_report": f"Error generating final report: {e}",
-                    **cleared_state
+                    "final_report": f"Error generating final report: {e}"
                 }
     return {
-        "final_report": "Error generating final report: Maximum retries exceeded",
-        **cleared_state
+        "final_report": "Error generating final report: Maximum retries exceeded"
     }
 
 
-async def check_citations(state: AgentState, config: RunnableConfig):
+##########################
+# Post-Processing Subgraph
+# Handles citation check, URL conversion, and PDF generation
+# with isolated message state (doesn't receive parent's messages)
+##########################
+
+async def pp_check_citations(state: PostProcessingState, config: RunnableConfig):
     """Verify that all <ref> citations match research notes exactly.
     
     Uses citation_think_tool to analyze each citation and correct any
     paraphrased or hallucinated source sentences.
     
     Args:
-        state: Current agent state containing final_report and notes
+        state: Post-processing state with isolated messages
         config: Runtime configuration
         
     Returns:
         Dictionary with corrected final_report
     """
     from langchain.agents import create_agent
+    from langchain.agents.middleware import ToolCallLimitMiddleware
     
     configurable = Configuration.from_runnable_config(config)
     
@@ -719,6 +723,7 @@ async def check_citations(state: AgentState, config: RunnableConfig):
     
     # If no report or no notes, skip checking
     if not final_report or not notes:
+        print("Citation check: Skipping - no report or notes available")
         return {"final_report": final_report}
     
     # Combine notes for context
@@ -730,16 +735,21 @@ async def check_citations(state: AgentState, config: RunnableConfig):
         report=final_report
     )
     
-    # Create agent with citation_think_tool using new LangChain v1 API
-    citation_agent = create_agent(
-        model=configurable_model.with_config(citation_model_config),
-        tools=[citation_think_tool],
-        system_prompt=check_prompt
-    )
-    
     try:
-        # Run the citation check agent
-        result = await citation_agent.ainvoke({"messages": [HumanMessage(content="Please verify and correct all citations in the report.")]})
+        # Create agent with citation_think_tool and run limit middleware
+        citation_agent = create_agent(
+            model=configurable_model.with_config(citation_model_config),
+            tools=[citation_think_tool],
+            system_prompt=check_prompt,
+            middleware=[
+                ToolCallLimitMiddleware(run_limit=configurable.citation_check_tool_call_limit)
+            ]
+        )
+        
+        # Run the citation check agent with fresh messages (isolated from parent)
+        result = await citation_agent.ainvoke({
+            "messages": [HumanMessage(content="Please verify and correct all citations in the report.")]
+        })
         
         # Extract the corrected report from the last AI message
         for msg in reversed(result.get("messages", [])):
@@ -754,18 +764,17 @@ async def check_citations(state: AgentState, config: RunnableConfig):
         
     except Exception as e:
         print(f"Citation check failed: {e}")
-        # On error, return original report
         return {"final_report": final_report}
 
 
-async def convert_refs_to_urls(state: AgentState, config: RunnableConfig):
+async def pp_convert_refs_to_urls(state: PostProcessingState, config: RunnableConfig):
     """Convert <ref> tags to text-fragment URLs for PDF generation.
     
     Uses an LLM to convert <ref id="N">"source sentence"</ref> tags
     to markdown links with text-fragment URLs in range format.
     
     Args:
-        state: Current agent state containing final_report
+        state: Post-processing state containing final_report
         config: Runtime configuration
         
     Returns:
@@ -789,7 +798,7 @@ async def convert_refs_to_urls(state: AgentState, config: RunnableConfig):
     conversion_prompt = convert_refs_to_urls_prompt.format(report=final_report)
     
     try:
-        # Invoke the model to convert refs to URLs
+        # Invoke the model with fresh message (isolated from parent)
         result = await configurable_model.with_config(conversion_model_config).ainvoke([
             HumanMessage(content=conversion_prompt)
         ])
@@ -804,19 +813,19 @@ async def convert_refs_to_urls(state: AgentState, config: RunnableConfig):
         return {"final_report_pdf": final_report}
 
 
-async def convert_to_pdf(state: AgentState, config: RunnableConfig):
-    """Convert the final report from markdown to PDF.
+async def pp_convert_to_pdf(state: PostProcessingState, config: RunnableConfig):
+    """Convert the final report from markdown to PDF and save markdown.
     
     Uses WeasyPrint to convert markdown → HTML → PDF with professional styling.
-    Uses final_report_pdf (with text-fragment URLs) for PDF generation.
-    Adds markdown report to messages for UI display.
+    - Saves markdown file with citation-corrected content (final_report with <ref> tags)
+    - Generates PDF from final_report_pdf (with text-fragment URLs for clickable links)
     
     Args:
-        state: Current agent state containing final_report and final_report_pdf
+        state: Post-processing state containing final_report and final_report_pdf
         config: Runtime configuration
         
     Returns:
-        Dictionary with pdf_path, md_path, and messages
+        Dictionary with pdf_path and md_path
     """
     final_report = state.get("final_report", "")
     # Use URL-converted version for PDF, fall back to original
@@ -824,7 +833,8 @@ async def convert_to_pdf(state: AgentState, config: RunnableConfig):
     
     if not final_report:
         return {
-            "pdf_path": None
+            "pdf_path": None,
+            "md_path": None
         }
     
     # Extract and sanitize title for filename
@@ -842,31 +852,28 @@ async def convert_to_pdf(state: AgentState, config: RunnableConfig):
         print(f"Warning: Failed to create docs directory: {e}")
         return {
             "pdf_path": None,
-            "messages": [AIMessage(content=final_report)]
+            "md_path": None
         }
     
     pdf_path = os.path.join(docs_dir, f"{sanitized_title}_{timestamp}.pdf")
     md_path = os.path.join(docs_dir, f"{sanitized_title}_{timestamp}.md")
     
-    # Save markdown version with text-fragment URLs for reference
-    md_success = await save_markdown_file(pdf_ready_content, md_path)
+    # Save markdown version with citation-corrected content (final_report with <ref> tags)
+    # This preserves the readable format before URL conversion
+    md_success = await save_markdown_file(final_report, md_path)
     if md_success:
         print(f"Markdown saved to: {md_path}")
     else:
         print(f"Warning: Failed to save markdown file")
     
-    # Generate PDF from URL-converted content
+    # Generate PDF from URL-converted content (with text-fragment links)
     pdf_success = await generate_pdf_from_markdown(pdf_ready_content, pdf_path, title)
-    
-    # Create the final message with markdown report (appears in UI)
-    final_message = AIMessage(content=final_report)
     
     if pdf_success:
         print(f"PDF generated successfully: {pdf_path}")
         return {
             "pdf_path": pdf_path,
-            "md_path": md_path,
-            "messages": [final_message]
+            "md_path": md_path
         }
     
     # PDF generation failed - markdown already saved above
@@ -874,16 +881,73 @@ async def convert_to_pdf(state: AgentState, config: RunnableConfig):
         print(f"PDF generation failed, markdown available at: {md_path}")
         return {
             "pdf_path": None,
-            "md_path": md_path,
-            "messages": [final_message]
+            "md_path": md_path
         }
     
     return {
         "pdf_path": None,
-        "md_path": None,
-        "messages": [final_message]
+        "md_path": None
     }
 
+
+# Build the post-processing subgraph with isolated state
+post_processing_builder = StateGraph(
+    PostProcessingState, 
+    input=PostProcessingInputState,
+    output=PostProcessingOutputState,
+    config_schema=Configuration
+)
+post_processing_builder.add_node("check_citations", pp_check_citations)
+post_processing_builder.add_node("convert_refs_to_urls", pp_convert_refs_to_urls)
+post_processing_builder.add_node("convert_to_pdf", pp_convert_to_pdf)
+post_processing_builder.add_edge(START, "check_citations")
+post_processing_builder.add_edge("check_citations", "convert_refs_to_urls")
+post_processing_builder.add_edge("convert_refs_to_urls", "convert_to_pdf")
+post_processing_builder.add_edge("convert_to_pdf", END)
+post_processing_subgraph = post_processing_builder.compile()
+
+
+async def post_process_report(state: AgentState, config: RunnableConfig):
+    """Wrapper node that invokes the post-processing subgraph.
+    
+    Transforms parent state to subgraph input, invokes subgraph,
+    and transforms results back to parent state.
+    
+    This achieves message isolation - the subgraph has its own
+    message state and doesn't receive the parent's messages.
+    
+    Args:
+        state: Parent AgentState
+        config: Runtime configuration
+        
+    Returns:
+        Dictionary with updated final_report, final_report_pdf, pdf_path, md_path, and messages
+    """
+    # Transform parent state to subgraph input
+    subgraph_input = {
+        "final_report": state.get("final_report", ""),
+        "notes": state.get("notes", [])
+    }
+    
+    # Invoke the subgraph with isolated state
+    subgraph_output = await post_processing_subgraph.ainvoke(subgraph_input, config)
+    
+    final_report = subgraph_output.get("final_report", state.get("final_report", ""))
+    final_message = AIMessage(content=final_report)
+    
+    return {
+        "final_report": final_report,
+        "final_report_pdf": subgraph_output.get("final_report_pdf", ""),
+        "pdf_path": subgraph_output.get("pdf_path"),
+        "md_path": subgraph_output.get("md_path"),
+        "messages": [final_message],
+        "notes": {"type": "override", "value": []}
+    }
+
+
+##########################
+# Main Graph
+##########################
 
 deep_researcher_builder = StateGraph(AgentState, input=AgentInputState, config_schema=Configuration)
 deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)
@@ -892,14 +956,12 @@ deep_researcher_builder.add_node("approve_research_brief", approve_research_brie
 deep_researcher_builder.add_node("write_draft_report", write_draft_report)
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)
-deep_researcher_builder.add_node("check_citations", check_citations)
-deep_researcher_builder.add_node("convert_refs_to_urls", convert_refs_to_urls)
-deep_researcher_builder.add_node("convert_to_pdf", convert_to_pdf)
+# Post-processing subgraph handles: citation check → URL conversion → PDF generation
+# with isolated message state (doesn't receive parent's messages)
+deep_researcher_builder.add_node("post_process_report", post_process_report)
 deep_researcher_builder.add_edge(START, "clarify_with_user")
 deep_researcher_builder.add_edge("research_supervisor", "final_report_generation")
-deep_researcher_builder.add_edge("final_report_generation", "check_citations")
-deep_researcher_builder.add_edge("check_citations", "convert_refs_to_urls")
-deep_researcher_builder.add_edge("convert_refs_to_urls", "convert_to_pdf")
-deep_researcher_builder.add_edge("convert_to_pdf", END)
+deep_researcher_builder.add_edge("final_report_generation", "post_process_report")
+deep_researcher_builder.add_edge("post_process_report", END)
 
 graph = deep_researcher_builder.compile(name = "deep_researcher")

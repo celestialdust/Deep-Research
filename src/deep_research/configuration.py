@@ -104,11 +104,11 @@ class Configuration(BaseModel):
         }
     )
     max_researcher_iterations: int = Field(
-        default=3,
+        default=7,
         metadata={
             "x_oap_ui_config": {
                 "type": "slider",
-                "default": 3,
+                "default": 10,
                 "min": 1,
                 "max": 10,
                 "step": 1,
@@ -117,7 +117,7 @@ class Configuration(BaseModel):
         }
     )
     max_react_tool_calls: int = Field(
-        default=5,
+        default=4,
         metadata={
             "x_oap_ui_config": {
                 "type": "slider",
@@ -234,7 +234,7 @@ class Configuration(BaseModel):
         }
     )
     research_model: str = Field(
-        default="azure_openai:o4-mini",
+        default="azure_openai:gpt-5",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
@@ -296,7 +296,7 @@ class Configuration(BaseModel):
     
     # Citation Check Configuration
     citation_check_model: str = Field(
-        default="azure_openai:o4-mini",
+        default="azure_openai:gpt-5",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
@@ -315,10 +315,22 @@ class Configuration(BaseModel):
             }
         }
     )
+    citation_check_tool_call_limit: int = Field(
+        default=20,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 20,
+                "min": 5,
+                "max": 50,
+                "description": "Maximum number of tool calls allowed for citation check agent per run"
+            }
+        }
+    )
     
     # PDF Conversion Configuration
     pdf_conversion_model: str = Field(
-        default="azure_openai:o4-mini",
+        default="azure_openai:gpt-5",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",

@@ -102,3 +102,26 @@ class ResearcherState(TypedDict):
 class ResearcherOutputState(BaseModel):
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []
+
+class PostProcessingState(TypedDict):
+    """State for post-processing subgraph with isolated messages."""
+    post_processing_messages: Annotated[list[MessageLikeRepresentation], operator.add]
+    final_report: str
+    notes: list[str]
+    final_report_pdf: str
+    pdf_path: Optional[str]
+    md_path: Optional[str]
+
+
+class PostProcessingInputState(TypedDict):
+    """Input state for post-processing subgraph."""
+    final_report: str
+    notes: list[str]
+
+
+class PostProcessingOutputState(TypedDict):
+    """Output state for post-processing subgraph."""
+    final_report: str  # Corrected report after citation check
+    final_report_pdf: str  # Report with URLs for PDF
+    pdf_path: Optional[str]
+    md_path: Optional[str]

@@ -824,7 +824,7 @@ citation_check_prompt = """You are a citation verification agent. Your task is t
 {notes}
 </Research Notes>
 
-<Report to Verify>
+<Report>
 {report}
 </Report>
 
