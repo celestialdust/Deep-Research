@@ -1,22 +1,304 @@
 import os
+import uuid
 import aiohttp
 import asyncio
 import logging
 import warnings
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, List, Literal, Dict, Optional, Any
+from typing import Annotated, List, Literal, Dict, Optional, Any, cast, Callable, Iterable
 from langchain_core.tools import BaseTool, StructuredTool, tool, ToolException, InjectedToolArg
-from langchain_core.messages import HumanMessage, AIMessage, MessageLikeRepresentation, filter_messages
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, AnyMessage, MessageLikeRepresentation, filter_messages, RemoveMessage
+from langchain_core.messages.utils import count_tokens_approximately, trim_messages
+
+TokenCounter = Callable[[Iterable[MessageLikeRepresentation]], int]
 from langchain_core.runnables import RunnableConfig
 from langchain_core.language_models import BaseChatModel
 from langchain.chat_models import init_chat_model
 from tavily import AsyncTavilyClient
 from langgraph.config import get_store
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from mcp import McpError
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from .state import Summary, ResearchComplete
 from .configuration import SearchAPI, Configuration
-from .prompts import summarize_webpage_prompt, report_generation_with_draft_insight_prompt
+from .prompts import summarize_webpage_prompt, report_generation_with_draft_insight_prompt, context_summarization_prompt
+
+##########################
+# Context Summarization
+##########################
+
+_DEFAULT_MESSAGES_TO_KEEP = 20
+_DEFAULT_TRIM_TOKEN_LIMIT = 4000
+_DEFAULT_FALLBACK_MESSAGE_COUNT = 15
+_SEARCH_RANGE_FOR_TOOL_PAIRS = 5
+
+
+class MessageSummarizer:
+    """Summarizes messages when token limits are approached.
+    
+    This class mirrors the SummarizationMiddleware from LangChain v1 but is designed
+    for use with custom LangGraph StateGraph implementations. It monitors message token
+    counts and automatically summarizes older messages when a threshold is reached,
+    preserving recent messages and maintaining context continuity by ensuring AI/Tool
+    message pairs remain together.
+    
+    Key features (aligned with SummarizationMiddleware):
+    - Configurable token counter function
+    - Safe cutoff point detection to preserve AI/Tool message pairs
+    - Configurable summary prompt and prefix
+    - Both sync and async summarization support
+    """
+
+    def __init__(
+        self,
+        model: BaseChatModel,
+        max_tokens_before_summary: int,
+        messages_to_keep: int = _DEFAULT_MESSAGES_TO_KEEP,
+        token_counter: TokenCounter = count_tokens_approximately,
+        summary_prompt: str = context_summarization_prompt,
+    ) -> None:
+        """Initialize message summarizer.
+
+        Args:
+            model: The language model to use for generating summaries.
+            max_tokens_before_summary: Token threshold to trigger summarization.
+            messages_to_keep: Number of recent messages to preserve after summarization.
+            token_counter: Function to count tokens in messages. Defaults to count_tokens_approximately.
+            summary_prompt: Prompt template for generating summaries.
+        """
+        self.model = model
+        self.max_tokens_before_summary = max_tokens_before_summary
+        self.messages_to_keep = messages_to_keep
+        self.token_counter = token_counter
+        self.summary_prompt = summary_prompt
+
+    async def before_model(self, messages: List[AnyMessage]) -> Dict[str, Any] | None:
+        """Process messages before model invocation, potentially triggering summarization.
+        
+        Args:
+            messages: List of messages to potentially summarize
+            
+        Returns:
+            State updates with RemoveMessage pattern if summarization triggered, None otherwise
+        """
+        if not messages:
+            return None
+            
+        self._ensure_message_ids(messages)
+        total_tokens = self.token_counter(messages)
+        
+        if total_tokens < self.max_tokens_before_summary:
+            return None  # No changes needed
+            
+        cutoff_index = self._find_safe_cutoff(messages)
+        
+        if cutoff_index <= 0:
+            return None  # Can't summarize
+            
+        messages_to_summarize, preserved_messages = self._partition_messages(messages, cutoff_index)
+        
+        summary = await self._create_summary_async(messages_to_summarize)
+        new_messages = self._build_new_messages(summary)
+        
+        return {
+            "messages": [
+                RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                *new_messages,
+                *preserved_messages,
+            ]
+        }
+
+    def _build_new_messages(self, summary: str) -> List[HumanMessage]:
+        """Build new messages with summary."""
+        return [
+            HumanMessage(content=f"Here is a summary of the conversation to date:\n\n{summary}")
+        ]
+
+    def _ensure_message_ids(self, messages: List[AnyMessage]) -> None:
+        """Ensure all messages have unique IDs."""
+        for msg in messages:
+            if msg.id is None:
+                msg.id = str(uuid.uuid4())
+
+    def _partition_messages(
+        self,
+        conversation_messages: List[AnyMessage],
+        cutoff_index: int,
+    ) -> tuple[List[AnyMessage], List[AnyMessage]]:
+        """Partition messages into those to summarize and those to preserve."""
+        messages_to_summarize = conversation_messages[:cutoff_index]
+        preserved_messages = conversation_messages[cutoff_index:]
+        return messages_to_summarize, preserved_messages
+
+    def _find_safe_cutoff(self, messages: List[AnyMessage]) -> int:
+        """Find safe cutoff point that preserves AI/Tool message pairs.
+
+        Returns the index where messages can be safely cut without separating
+        related AI and Tool messages. Returns 0 if no safe cutoff is found.
+        """
+        if len(messages) <= self.messages_to_keep:
+            return 0
+
+        target_cutoff = len(messages) - self.messages_to_keep
+
+        for i in range(target_cutoff, -1, -1):
+            if self._is_safe_cutoff_point(messages, i):
+                return i
+
+        return 0
+
+    def _is_safe_cutoff_point(self, messages: List[AnyMessage], cutoff_index: int) -> bool:
+        """Check if cutting at index would separate AI/Tool message pairs."""
+        if cutoff_index >= len(messages):
+            return True
+
+        search_start = max(0, cutoff_index - _SEARCH_RANGE_FOR_TOOL_PAIRS)
+        search_end = min(len(messages), cutoff_index + _SEARCH_RANGE_FOR_TOOL_PAIRS)
+
+        for i in range(search_start, search_end):
+            if not self._has_tool_calls(messages[i]):
+                continue
+
+            tool_call_ids = self._extract_tool_call_ids(cast(AIMessage, messages[i]))
+            if self._cutoff_separates_tool_pair(messages, i, cutoff_index, tool_call_ids):
+                return False
+
+        return True
+
+    def _has_tool_calls(self, message: AnyMessage) -> bool:
+        """Check if message is an AI message with tool calls."""
+        return bool(
+            isinstance(message, AIMessage) 
+            and hasattr(message, "tool_calls") 
+            and message.tool_calls
+        )
+
+    def _extract_tool_call_ids(self, ai_message: AIMessage) -> set[str]:
+        """Extract tool call IDs from an AI message."""
+        tool_call_ids = set()
+        for tc in ai_message.tool_calls:
+            call_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+            if call_id is not None:
+                tool_call_ids.add(call_id)
+        return tool_call_ids
+
+    def _cutoff_separates_tool_pair(
+        self,
+        messages: List[AnyMessage],
+        ai_message_index: int,
+        cutoff_index: int,
+        tool_call_ids: set[str],
+    ) -> bool:
+        """Check if cutoff separates an AI message from its corresponding tool messages."""
+        for j in range(ai_message_index + 1, len(messages)):
+            message = messages[j]
+            if isinstance(message, ToolMessage) and message.tool_call_id in tool_call_ids:
+                ai_before_cutoff = ai_message_index < cutoff_index
+                tool_before_cutoff = j < cutoff_index
+                if ai_before_cutoff != tool_before_cutoff:
+                    return True
+        return False
+
+    async def _create_summary_async(self, messages_to_summarize: List[AnyMessage]) -> str:
+        """Generate summary for the given messages (async version)."""
+        if not messages_to_summarize:
+            return "No previous conversation history."
+
+        trimmed_messages = self._trim_messages_for_summary(messages_to_summarize)
+        if not trimmed_messages:
+            return "Previous conversation was too long to summarize."
+
+        # Format messages for the summary prompt
+        formatted_messages = self._format_messages_for_summary(trimmed_messages)
+        
+        try:
+            response = await self.model.ainvoke([
+                HumanMessage(content=self.summary_prompt.format(messages=formatted_messages))
+            ])
+            return cast(str, response.content).strip()
+        except Exception as e:
+            logging.error(f"Error generating summary: {e}")
+            return f"Error generating summary: {str(e)}"
+
+    def _trim_messages_for_summary(self, messages: List[AnyMessage]) -> List[AnyMessage]:
+        """Trim messages to fit within summary generation limits."""
+        try:
+            return trim_messages(
+                messages,
+                max_tokens=_DEFAULT_TRIM_TOKEN_LIMIT,
+                token_counter=self.token_counter,  # Use configurable token counter
+                start_on="human",
+                strategy="last",
+                allow_partial=True,
+                include_system=True,
+            )
+        except Exception:
+            return messages[-_DEFAULT_FALLBACK_MESSAGE_COUNT:]
+
+    def _format_messages_for_summary(self, messages: List[AnyMessage]) -> str:
+        """Format messages into a string for the summary prompt."""
+        formatted_parts = []
+        for msg in messages:
+            role = msg.__class__.__name__.replace("Message", "")
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            formatted_parts.append(f"[{role}]: {content}")
+        return "\n\n".join(formatted_parts)
+
+
+async def invoke_model_with_summarization(
+    model: BaseChatModel,
+    messages: List[AnyMessage],
+    config: RunnableConfig,
+    message_key: str = "messages"
+) -> AIMessage:
+    """Invoke model with automatic context summarization if enabled.
+    
+    This function wraps the model invocation pattern with automatic summarization:
+    1. Checks if context summarization is enabled
+    2. If enabled, summarizes messages using a dedicated summarization model
+    3. Invokes the node's model with the (potentially summarized) messages
+    
+    Args:
+        model: The model to invoke (node's task model, not summarization model)
+        messages: Messages to process and pass to the model
+        config: Runtime configuration
+        message_key: State key for the messages (e.g., "supervisor_messages")
+        
+    Returns:
+        AIMessage response from the model
+    """
+    configurable = Configuration.from_runnable_config(config)
+    
+    # Apply context summarization if enabled
+    if configurable.enable_context_summarization and messages:
+        summarizer_model_config = build_model_config(
+            configurable.context_summarization_model,
+            8192,
+            config,
+            ["langsmith:nostream"]
+        )
+        summarizer = MessageSummarizer(
+            model=init_chat_model(**summarizer_model_config),
+            max_tokens_before_summary=configurable.max_tokens_before_summary,
+            messages_to_keep=configurable.messages_to_keep,
+        )
+        
+        # Get state updates from before_model
+        state_updates = await summarizer.before_model(messages)
+        
+        # If summarization occurred, extract the updated messages
+        if state_updates and "messages" in state_updates:
+            # Filter out RemoveMessage and get the actual messages
+            updated_messages = [
+                msg for msg in state_updates["messages"]
+                if not isinstance(msg, RemoveMessage)
+            ]
+            messages = updated_messages
+    
+    # Invoke the node's model with potentially summarized messages
+    response = await model.ainvoke(messages)
+    return response
+
 
 ##########################
 # Tavily Search Tool Utils
@@ -59,7 +341,8 @@ async def tavily_search(
             if url not in unique_results:
                 unique_results[url] = {**result, "query": response['query']}
     configurable = Configuration.from_runnable_config(config)
-    max_char_to_include = 50_000   # NOTE: This can be tuned by the developer. This character count keeps us safely under input token limits for the latest models.
+    # Reduced from 50k to 30k to account for the longer summarization prompt with claim-source pair extraction
+    max_char_to_include = 30_000
     model_config = build_model_config(
         configurable.summarization_model,
         configurable.summarization_model_max_tokens,
@@ -72,9 +355,11 @@ async def tavily_search(
     summarization_tasks = [
         noop() if not result.get("raw_content") else summarize_webpage(
             summarization_model, 
-            result['raw_content'][:max_char_to_include],
+            result['raw_content'],  # summarize_webpage handles truncation internally
+            url,
+            max_content_chars=max_char_to_include,
         )
-        for result in unique_results.values()
+        for url, result in unique_results.items()
     ]
     summaries = await asyncio.gather(*summarization_tasks)
     summarized_results = {
@@ -84,8 +369,8 @@ async def tavily_search(
     for i, (url, result) in enumerate(summarized_results.items()):
         formatted_output += f"\n\n--- SOURCE {i+1}: {result['title']} ---\n"
         formatted_output += f"URL: {url}\n\n"
-        formatted_output += f"SUMMARY:\n{result['content']}\n\n"
-        formatted_output += "\n\n" + "-" * 80 + "\n"
+        formatted_output += f"CONTENT:\n{result['content']}\n"
+        formatted_output += "-" * 80 + "\n"
     if summarized_results:
         return formatted_output
     else:
@@ -107,16 +392,85 @@ async def tavily_search_async(search_queries, max_results: int = 5, topic: Liter
     search_docs = await asyncio.gather(*search_tasks)
     return search_docs
 
-async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
+async def summarize_webpage(model: BaseChatModel, webpage_content: str, url: str, max_content_chars: int = 30000) -> str:
+    """Summarize a webpage and extract atomic claim-source pairs for text-fragment citations.
+    
+    Args:
+        model: The language model to use for summarization
+        webpage_content: The raw content of the webpage
+        url: The URL of the webpage (passed to prompt for context, not stored in pairs)
+        max_content_chars: Maximum characters of content to include (default 30000 to stay within token limits)
+        
+    Returns:
+        Formatted string with summary and claim-source pairs for downstream citation generation.
+        The URL context is provided separately and should be combined with claim-source pairs by the caller.
+    """
+    # Truncate content to avoid token limit issues
+    # The prompt itself is ~2000 tokens, so we need to leave room
+    truncated_content = webpage_content[:max_content_chars]
+    if len(webpage_content) > max_content_chars:
+        truncated_content += "\n\n[Content truncated due to length...]"
+    
     try:
         summary = await asyncio.wait_for(
-            model.ainvoke([HumanMessage(content=summarize_webpage_prompt.format(webpage_content=webpage_content, date=get_today_str()))]),
-            timeout=60.0
+            model.ainvoke([HumanMessage(content=summarize_webpage_prompt.format(
+                webpage_content=truncated_content, 
+                url=url,
+                date=get_today_str()
+            ))]),
+            timeout=180.0  # Extended timeout for complex webpages (news sites, academic pages)
         )
-        return f"""<summary>\n{summary.summary}\n</summary>\n\n<key_excerpts>\n{summary.key_excerpts}\n</key_excerpts>"""
-    except (asyncio.TimeoutError, Exception) as e:
-        print(f"Failed to summarize webpage: {str(e)}")
-        return webpage_content
+        
+        # Format the claim-source pairs for downstream use
+        # URL is provided in the source context header, not in each pair
+        claim_source_output = ""
+        if summary.claim_source_pairs:
+            claim_source_output = "\n<claim_source_pairs>\n"
+            for pair in summary.claim_source_pairs:
+                claim_source_output += f"- Claim: {pair.claim}\n"
+                claim_source_output += f"  Source Sentence: \"{pair.source_sentence}\"\n\n"
+            claim_source_output += "</claim_source_pairs>"
+        
+        return f"""<summary>\n{summary.summary}\n</summary>\n{claim_source_output}"""
+    
+    except asyncio.TimeoutError:
+        print(f"Summarization timed out for URL: {url}")
+        # Return truncated content as fallback
+        return f"<summary>\n{truncated_content[:5000]}...\n</summary>\n<note>Summarization timed out - showing truncated content</note>"
+    
+    except Exception as e:
+        error_type = type(e).__name__
+        error_msg = str(e)
+        print(f"Failed to summarize webpage ({error_type}): {error_msg[:200]}")
+        
+        # Check if it's a token limit or parsing error
+        if "token" in error_msg.lower() or "context" in error_msg.lower():
+            # Try with even shorter content
+            shorter_content = webpage_content[:15000]
+            print(f"Retrying with shorter content ({len(shorter_content)} chars)...")
+            try:
+                summary = await asyncio.wait_for(
+                    model.ainvoke([HumanMessage(content=summarize_webpage_prompt.format(
+                        webpage_content=shorter_content, 
+                        url=url,
+                        date=get_today_str()
+                    ))]),
+                    timeout=120.0  # Extended retry timeout for complex pages
+                )
+                claim_source_output = ""
+                if summary.claim_source_pairs:
+                    claim_source_output = "\n<claim_source_pairs>\n"
+                    for pair in summary.claim_source_pairs:
+                        claim_source_output += f"- Claim: {pair.claim}\n"
+                        claim_source_output += f"  Source Sentence: \"{pair.source_sentence}\"\n\n"
+                    claim_source_output += "</claim_source_pairs>"
+                return f"""<summary>\n{summary.summary}\n</summary>\n{claim_source_output}"""
+            except Exception as retry_error:
+                print(f"Retry also failed: {str(retry_error)[:100]}")
+        
+        # Return a basic summary as fallback
+        fallback_summary = truncated_content[:3000] if len(truncated_content) > 3000 else truncated_content
+        return f"<summary>\n{fallback_summary}...\n</summary>\n<note>Automatic summarization failed - showing raw content excerpt</note>"
 
 
 ##########################
@@ -286,7 +640,7 @@ async def get_search_tool(search_api: SearchAPI):
         return []
     
 async def get_all_tools(config: RunnableConfig):
-    tools = [tool(ResearchComplete)]
+    tools = [tool(ResearchComplete), think_tool]
     configurable = Configuration.from_runnable_config(config)
     search_api = SearchAPI(get_config_value(configurable.search_api))
     tools.extend(await get_search_tool(search_api))
@@ -561,6 +915,41 @@ def think_tool(reflection: str) -> str:
     """
     return f"Reflection recorded: {reflection}"
 
+
+@tool
+def citation_think_tool(analysis: str) -> str:
+    """Tool for analyzing citation accuracy and planning corrections.
+    
+    Use this tool to systematically verify each citation in the report against research notes.
+    This creates a deliberate analysis step before making any corrections.
+    
+    When to use:
+    - Before verifying a citation: Record the ref ID and quoted sentence
+    - During comparison: Note whether the quote matches the notes exactly
+    - When finding corrections: Record the exact verbatim sentence from notes
+    - After analysis: Plan the specific correction to make
+    
+    Analysis should address:
+    1. Citation identification - Which ref ID and what quoted sentence?
+    2. Verification status - Does the quote exist VERBATIM in research notes?
+    3. Source matching - Is the quote attributed to the correct source ID?
+    4. Correction plan - If not exact match, what is the correct verbatim sentence?
+    
+    Example analysis:
+    "Checking ref id=1: 'PFS improved significantly.' 
+     - Found in notes: 'The 36-month PFS was 65.4% in the zanubrutinib group.'
+     - Status: PARAPHRASED - quote is not verbatim
+     - Correction: Replace with exact sentence from notes"
+    
+    Args:
+        analysis: Detailed analysis of citation accuracy, source verification, and planned corrections
+        
+    Returns:
+        Confirmation that citation analysis was recorded
+    """
+    return f"Citation analysis recorded: {analysis}"
+
+
 @tool
 def refine_draft_report(
     research_brief: Annotated[str, InjectedToolArg],
@@ -599,3 +988,346 @@ def refine_draft_report(
     response = writer_model.invoke([HumanMessage(content=draft_report_prompt)])
     
     return response.content
+
+
+##########################
+# PDF Generation Utils
+##########################
+
+# Professional CSS styling matching OpenAI deep research format
+PDF_CSS_STYLES = '''
+@page {
+    size: A4;
+    margin: 1in;
+}
+
+body {
+    font-family: Georgia, "Times New Roman", Times, serif;
+    font-size: 11pt;
+    line-height: 1.6;
+    color: #1a1a1a;
+    max-width: 100%;
+}
+
+h1 {
+    font-size: 24pt;
+    font-weight: bold;
+    margin-top: 0;
+    margin-bottom: 24pt;
+    color: #000;
+    border-bottom: 2px solid #333;
+    padding-bottom: 12pt;
+}
+
+h2 {
+    font-size: 16pt;
+    font-weight: bold;
+    margin-top: 24pt;
+    margin-bottom: 12pt;
+    color: #1a1a1a;
+}
+
+h3 {
+    font-size: 13pt;
+    font-weight: bold;
+    margin-top: 18pt;
+    margin-bottom: 9pt;
+    color: #333;
+}
+
+p {
+    margin-bottom: 12pt;
+    text-align: justify;
+}
+
+a {
+    color: #0066cc;
+    text-decoration: none;
+}
+
+a:hover {
+    text-decoration: underline;
+}
+
+/* OpenAI-style circular citation badge styling */
+.citation {
+    display: inline-block;
+    vertical-align: middle;
+    position: relative;
+    top: -0.1em;
+    margin-left: 0;
+    margin-right: 5px;
+}
+
+.citation a {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background-color: #f0f0f0;
+    color: #444;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border-radius: 50%;
+    font-family: Georgia, "Times New Roman", Times, serif;
+    font-size: 11px;
+    font-weight: normal;
+    text-decoration: none;
+    border: none;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+    box-sizing: border-box;
+}
+
+.citation a:hover {
+    background-color: #e5e5e5;
+    text-decoration: none;
+}
+
+/* Small spacer between consecutive citations */
+.cit-spacer {
+    display: inline-block;
+    width: 5px;
+}
+
+/* PDF links are clickable - no need to show URLs after link text */
+/* Links remain clickable in the generated PDF */
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 18pt 0;
+    font-size: 10pt;
+}
+
+th, td {
+    border: 1px solid #ccc;
+    padding: 8pt 12pt;
+    text-align: left;
+}
+
+th {
+    background-color: #f5f5f5;
+    font-weight: bold;
+}
+
+tr:nth-child(even) {
+    background-color: #fafafa;
+}
+
+code {
+    font-family: "Courier New", Courier, monospace;
+    font-size: 10pt;
+    background-color: #f4f4f4;
+    padding: 2pt 4pt;
+    border-radius: 3pt;
+}
+
+pre {
+    background-color: #f4f4f4;
+    padding: 12pt;
+    border-radius: 4pt;
+    overflow-x: auto;
+    font-size: 9pt;
+    line-height: 1.4;
+}
+
+pre code {
+    background-color: transparent;
+    padding: 0;
+}
+
+blockquote {
+    border-left: 3pt solid #ccc;
+    margin: 12pt 0;
+    padding-left: 18pt;
+    color: #555;
+    font-style: italic;
+}
+
+ul, ol {
+    margin-bottom: 12pt;
+    padding-left: 24pt;
+}
+
+li {
+    margin-bottom: 6pt;
+}
+'''
+
+
+def convert_citations_to_superscript(html_content: str) -> str:
+    """Convert markdown-style citation links to OpenAI-style superscript citations.
+    
+    Transforms links like <a href="url">1</a> where the text is a number
+    into styled superscript citations matching the OpenAI deep research format.
+    
+    Args:
+        html_content: HTML content with citation links
+        
+    Returns:
+        HTML content with citations converted to superscript format
+    """
+    import re
+    
+    # Pattern to match citation links: <a href="...">citation</a>
+    # where citation is 1-3 digits optionally followed by a letter (e.g., "1", "2a", "13b")
+    # Also handles comma-separated citations like "1, 2, 3" or "2a, 2b"
+    citation_pattern = re.compile(
+        r'<a\s+href="([^"]+)"[^>]*>(\d{1,3}[a-zA-Z]?(?:\s*,\s*\d{1,3}[a-zA-Z]?)*)</a>',
+        re.IGNORECASE
+    )
+    
+    def replace_citation(match):
+        url = match.group(1)
+        citation_numbers = match.group(2)
+        
+        # Handle multiple citations like "1, 2, 3"
+        numbers = [n.strip() for n in citation_numbers.split(',')]
+        
+        # For single citation
+        if len(numbers) == 1:
+            return f'<span class="citation"><a href="{url}">{numbers[0]}</a></span>'
+        
+        # For multiple citations, we keep them in one span but they share the same URL
+        # This handles cases like [1, 2](url) though typically each has its own URL
+        citation_html = ', '.join(
+            f'<a href="{url}">{n}</a>' for n in numbers
+        )
+        return f'<span class="citation">{citation_html}</span>'
+    
+    result = citation_pattern.sub(replace_citation, html_content)
+    
+    # Insert small spacer between consecutive citations to prevent overlapping
+    result = re.sub(
+        r'</span>(\s*)<span class="citation">',
+        r'</span>\1<span class="cit-spacer"></span><span class="citation">',
+        result
+    )
+    
+    return result
+
+
+def sanitize_filename(title: str, max_length: int = 50) -> str:
+    """Sanitize a title for use as a filename.
+    
+    Args:
+        title: The title to sanitize
+        max_length: Maximum length of the sanitized filename
+        
+    Returns:
+        A sanitized filename-safe string
+    """
+    import re
+    sanitized = re.sub(r'[^\w\s-]', '', title).strip()
+    sanitized = re.sub(r'[-\s]+', '_', sanitized)
+    return sanitized[:max_length] if sanitized else "research_report"
+
+
+def extract_title_from_markdown(markdown_content: str) -> str:
+    """Extract the title from markdown content.
+    
+    Args:
+        markdown_content: The markdown content to extract title from
+        
+    Returns:
+        The extracted title or a default title
+    """
+    import re
+    title_match = re.search(r'^#\s+(.+)$', markdown_content, re.MULTILINE)
+    if title_match:
+        return title_match.group(1)
+    return "Research Report"
+
+
+async def generate_pdf_from_markdown(
+    markdown_content: str,
+    output_path: str,
+    title: str = "Research Report"
+) -> bool:
+    """Generate a PDF from markdown content using WeasyPrint.
+    
+    Converts markdown to HTML, transforms citation links to OpenAI-style
+    superscript format, and generates a professionally styled PDF.
+    
+    Args:
+        markdown_content: The markdown content to convert
+        output_path: Path where the PDF should be saved
+        title: Title for the PDF document
+        
+    Returns:
+        True if PDF was generated successfully, False otherwise
+    """
+    try:
+        import markdown
+        import sys
+        
+        # macOS: Configure library path for WeasyPrint's native dependencies (Pango, HarfBuzz, etc.)
+        # These are installed via Homebrew but Python needs to know where to find them
+        if sys.platform == 'darwin':
+            homebrew_lib = '/opt/homebrew/lib'
+            current_path = os.environ.get('DYLD_FALLBACK_LIBRARY_PATH', '')
+            if homebrew_lib not in current_path:
+                os.environ['DYLD_FALLBACK_LIBRARY_PATH'] = f"{homebrew_lib}:{current_path}" if current_path else homebrew_lib
+        
+        from weasyprint import HTML, CSS
+        
+        # Convert markdown to HTML
+        md_extensions = ['tables', 'fenced_code', 'toc', 'nl2br']
+        html_content = markdown.markdown(markdown_content, extensions=md_extensions)
+        
+        # Convert citation links to OpenAI-style superscript format
+        html_content = convert_citations_to_superscript(html_content)
+        
+        # Create CSS object
+        css_styles = CSS(string=PDF_CSS_STYLES)
+        
+        # Wrap HTML content with proper structure
+        full_html = f'''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>{title}</title>
+        </head>
+        <body>
+            {html_content}
+        </body>
+        </html>
+        '''
+        
+        # Generate PDF
+        def _generate():
+            html_doc = HTML(string=full_html)
+            html_doc.write_pdf(output_path, stylesheets=[css_styles])
+        
+        await asyncio.to_thread(_generate)
+        return True
+        
+    except ImportError as e:
+        print(f"PDF generation failed - missing dependencies: {e}")
+        print("Install with: pip install weasyprint markdown")
+        return False
+    except Exception as e:
+        print(f"PDF generation failed: {e}")
+        return False
+
+
+async def save_markdown_file(content: str, output_path: str) -> bool:
+    """Save markdown content to a file.
+    
+    Args:
+        content: The markdown content to save
+        output_path: Path where the file should be saved
+        
+    Returns:
+        True if file was saved successfully, False otherwise
+    """
+    try:
+        def _save():
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        await asyncio.to_thread(_save)
+        return True
+    except Exception as e:
+        print(f"Failed to save markdown file: {e}")
+        return False

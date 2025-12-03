@@ -17,9 +17,25 @@ class ConductResearch(BaseModel):
 class ResearchComplete(BaseModel):
     """Call this tool to indicate that the research is complete."""
 
+class ClaimSourcePair(BaseModel):
+    """Atomic claim with its supporting source sentence for text-fragment link generation."""
+    claim: str = Field(
+        description="A single factual claim extracted from the webpage"
+    )
+    source_sentence: str = Field(
+        description="The exact verbatim sentence from the source that supports this claim - do NOT paraphrase"
+    )
+
+
 class Summary(BaseModel):
-    summary: str
-    key_excerpts: str
+    """Structured summary output with atomic claim-source pairs for citation generation."""
+    summary: str = Field(
+        description="A comprehensive summary of the webpage content"
+    )
+    claim_source_pairs: list[ClaimSourcePair] = Field(
+        description="List of atomic claim-source pairs extracted from the webpage",
+        default_factory=list
+    )
 
 class ClarifyWithUser(BaseModel):
     need_clarification: bool = Field(
@@ -63,7 +79,10 @@ class AgentState(MessagesState):
     notes: Annotated[list[str], override_reducer] = []
     draft_report: str
     final_report: str
+    final_report_pdf: str = ""  # Report with refs converted to text-fragment URLs for PDF generation
     brief_refinement_rounds: int = 0
+    pdf_path: Optional[str] = None
+    md_path: Optional[str] = None  # Markdown output for observing URL link patterns
 
 class SupervisorState(TypedDict):
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]
@@ -83,3 +102,26 @@ class ResearcherState(TypedDict):
 class ResearcherOutputState(BaseModel):
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []
+
+class PostProcessingState(TypedDict):
+    """State for post-processing subgraph with isolated messages."""
+    post_processing_messages: Annotated[list[MessageLikeRepresentation], operator.add]
+    final_report: str
+    notes: list[str]
+    final_report_pdf: str
+    pdf_path: Optional[str]
+    md_path: Optional[str]
+
+
+class PostProcessingInputState(TypedDict):
+    """Input state for post-processing subgraph."""
+    final_report: str
+    notes: list[str]
+
+
+class PostProcessingOutputState(TypedDict):
+    """Output state for post-processing subgraph."""
+    final_report: str  # Corrected report after citation check
+    final_report_pdf: str  # Report with URLs for PDF
+    pdf_path: Optional[str]
+    md_path: Optional[str]

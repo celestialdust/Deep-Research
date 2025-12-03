@@ -4,6 +4,8 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import START, END, StateGraph
 from langgraph.types import Command, interrupt
 import asyncio
+import os
+from datetime import datetime
 from typing import Literal
 from .configuration import (
     Configuration, 
@@ -18,7 +20,10 @@ from .state import (
     DraftReport,
     ConductResearch,
     ResearchComplete,
-    ResearcherOutputState
+    ResearcherOutputState,
+    PostProcessingState,
+    PostProcessingInputState,
+    PostProcessingOutputState
 )
 from .prompts import (
     clarify_with_user_instructions,
@@ -28,7 +33,9 @@ from .prompts import (
     compress_research_system_prompt,
     compress_research_simple_human_message,
     final_report_generation_prompt,
-    lead_researcher_prompt
+    lead_researcher_prompt,
+    citation_check_prompt,
+    convert_refs_to_urls_prompt
 )
 from .utils import (
     get_today_str,
@@ -42,8 +49,15 @@ from .utils import (
     get_notes_from_tool_calls,
     build_model_config,
     think_tool,
+    citation_think_tool,
     refine_draft_report,
-    tavily_search
+    tavily_search,
+    MessageSummarizer,
+    invoke_model_with_summarization,
+    extract_title_from_markdown,
+    sanitize_filename,
+    generate_pdf_from_markdown,
+    save_markdown_file
 )
 
 # Initialize a configurable model that we will use throughout the agent
@@ -80,6 +94,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig)-> Comm
     )
     
     # Check if search is enabled for brief generation
+    raw_notes_content = None
     if configurable.enable_search_for_brief:
         # Use tool-calling model with Tavily search (max 1 search allowed)
         research_model_with_tools = configurable_model.bind_tools([tavily_search]).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(research_model_config)
@@ -95,6 +110,12 @@ async def write_research_brief(state: AgentState, config: RunnableConfig)-> Comm
         if initial_response.tool_calls:
             tool_call = initial_response.tool_calls[0]  # Only execute first tool call
             tool_result = await tavily_search.ainvoke(tool_call["args"], config)
+            
+            # Format raw notes like research agents do
+            raw_notes_content = "\n".join([
+                str(initial_response.content) if initial_response.content else "",
+                str(tool_result)
+            ])
             
             # Add tool message and get structured output
             messages_with_tool = initial_messages + [
@@ -117,11 +138,15 @@ async def write_research_brief(state: AgentState, config: RunnableConfig)-> Comm
             date=get_today_str()
         ))])
     
+    update_dict = {
+        "research_brief": response.research_brief
+    }
+    if raw_notes_content:
+        update_dict["raw_notes"] = [raw_notes_content]
+    
     return Command(
         goto="approve_research_brief", 
-        update={
-            "research_brief": response.research_brief
-        }
+        update=update_dict
     )
 
 
@@ -169,7 +194,6 @@ async def approve_research_brief(state: AgentState, config: RunnableConfig) -> C
     # Call interrupt() - this pauses execution and returns the resume value
     decision = interrupt(interrupt_payload)
     
-    # Process the decision
     # Expected format: {"type": "approve"} or {"type": "reject", "feedback": "..."}
     if not isinstance(decision, dict):
         return Command(goto="write_draft_report")
@@ -223,6 +247,7 @@ async def write_draft_report(state: AgentState, config: RunnableConfig) -> Comma
     )
     
     # Check if search is enabled for draft generation
+    raw_notes_content = None
     if configurable.enable_search_for_draft:
         # Use tool-calling model with Tavily search (max 1 search allowed)
         draft_model_with_tools = configurable_model.bind_tools([tavily_search]).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(draft_model_config)
@@ -236,14 +261,29 @@ async def write_draft_report(state: AgentState, config: RunnableConfig) -> Comma
         
         # If there are tool calls, execute them (max 1 iteration)
         if initial_response.tool_calls:
-            tool_call = initial_response.tool_calls[0]  # Only execute first tool call
-            tool_result = await tavily_search.ainvoke(tool_call["args"], config)
+            # Execute only the first tool call for search, but create responses for ALL
+            tool_results = []
+            raw_notes_parts = [str(initial_response.content) if initial_response.content else ""]
             
-            # Add tool message and get structured output
-            messages_with_tool = initial_messages + [
-                initial_response,
-                ToolMessage(content=tool_result, name=tool_call["name"], tool_call_id=tool_call["id"])
-            ]
+            for i, tool_call in enumerate(initial_response.tool_calls):
+                if i == 0:
+                    # Actually execute the first search
+                    tool_result = await tavily_search.ainvoke(tool_call["args"], config)
+                    raw_notes_parts.append(str(tool_result))
+                else:
+                    # For additional tool calls, provide a placeholder response
+                    # This satisfies OpenAI's requirement that all tool_calls have responses
+                    tool_result = "Search skipped - only one search allowed per draft generation."
+                
+                tool_results.append(
+                    ToolMessage(content=tool_result, name=tool_call["name"], tool_call_id=tool_call["id"])
+                )
+            
+            # Format raw notes
+            raw_notes_content = "\n".join(raw_notes_parts)
+            
+            # Add all tool messages to satisfy OpenAI API requirement
+            messages_with_tool = initial_messages + [initial_response] + tool_results
             
             # Now get structured output
             draft_model_structured = configurable_model.with_structured_output(DraftReport).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(draft_model_config)
@@ -260,22 +300,26 @@ async def write_draft_report(state: AgentState, config: RunnableConfig) -> Comma
             date=get_today_str()
         ))])
     
+    update_dict = {
+        "draft_report": response.draft_report,
+        "supervisor_messages": {
+            "type": "override",
+            "value": [
+                SystemMessage(content=lead_researcher_prompt.format(
+                    date=get_today_str(),
+                    max_concurrent_research_units=configurable.max_concurrent_research_units,
+                    max_researcher_iterations=configurable.max_researcher_iterations
+                )),
+                HumanMessage(content=state.get("research_brief", ""))
+            ]
+        }
+    }
+    if raw_notes_content:
+        update_dict["raw_notes"] = [raw_notes_content]
+    
     return Command(
         goto="research_supervisor",
-        update={
-            "draft_report": response.draft_report,
-            "supervisor_messages": {
-                "type": "override",
-                "value": [
-                    SystemMessage(content=lead_researcher_prompt.format(
-                        date=get_today_str(),
-                        max_concurrent_research_units=configurable.max_concurrent_research_units,
-                        max_researcher_iterations=configurable.max_researcher_iterations
-                    )),
-                    HumanMessage(content=state.get("research_brief", ""))
-                ]
-            }
-        }
+        update=update_dict
     )
 
 
@@ -290,7 +334,13 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     lead_researcher_tools = [ConductResearch, ResearchComplete, think_tool, refine_draft_report]
     research_model = configurable_model.bind_tools(lead_researcher_tools).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(research_model_config)
     supervisor_messages = state.get("supervisor_messages", [])
-    response = await research_model.ainvoke(supervisor_messages)
+    
+    response = await invoke_model_with_summarization(
+        model=research_model,
+        messages=supervisor_messages,
+        config=config,
+        message_key="supervisor_messages"
+    )
     return Command(
         goto="supervisor_tools",
         update={
@@ -444,8 +494,13 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         ["langsmith:nostream"]
     )
     research_model = configurable_model.bind_tools(tools).with_retry(stop_after_attempt=configurable.max_structured_output_retries).with_config(research_model_config)
-    # Need to add fault tolerance here.
-    response = await research_model.ainvoke(researcher_messages)
+    
+    response = await invoke_model_with_summarization(
+        model=research_model,
+        messages=researcher_messages,
+        config=config,
+        message_key="researcher_messages"
+    )
     return Command(
         goto="researcher_tools",
         update={
@@ -514,9 +569,15 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     # Update the system prompt to now focus on compression rather than research.
     researcher_messages[0] = SystemMessage(content=compress_research_system_prompt.format(date=get_today_str()))
     researcher_messages.append(HumanMessage(content=compress_research_simple_human_message.format(research_topic=research_topic)))
+    
     while synthesis_attempts < 3:
         try:
-            response = await synthesizer_model.ainvoke(researcher_messages)
+            response = await invoke_model_with_summarization(
+                model=synthesizer_model,
+                messages=researcher_messages,
+                config=config,
+                message_key="researcher_messages"
+            )
             return {
                 "compressed_research": str(response.content),
                 "raw_notes": ["\n".join([str(m.content) for m in filter_messages(researcher_messages, include_types=["tool", "ai"])])]
@@ -545,13 +606,40 @@ researcher_subgraph = researcher_builder.compile()
 
 async def final_report_generation(state: AgentState, config: RunnableConfig):
     notes = state.get("notes", [])
-    cleared_state = {"notes": {"type": "override", "value": []},}
+    raw_notes = state.get("raw_notes", [])
+    # Notes and messages will be cleared after citation check
     configurable = Configuration.from_runnable_config(config)
     writer_model_config = build_model_config(
         configurable.final_report_model,
         configurable.final_report_model_max_tokens,
         config
     )
+    
+    # Helper function to save notes AFTER successful report generation
+    async def save_notes_async():
+        """Save notes to files using async operations to avoid blocking."""
+        def write_file(path: str, content: str):
+            """Helper to write file with proper resource management."""
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        
+        docs_dir = os.path.join(os.path.dirname(__file__), '../../docs')
+        await asyncio.to_thread(os.makedirs, docs_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Save notes
+        if notes:
+            notes_path = os.path.join(docs_dir, f'notes_{timestamp}.md')
+            content = f"# Research Notes - {timestamp}\n\n" + '\n\n---\n\n'.join(notes)
+            await asyncio.to_thread(write_file, notes_path, content)
+            print(f"Notes saved to: {notes_path}")
+        
+        # Save raw_notes
+        if raw_notes:
+            raw_notes_path = os.path.join(docs_dir, f'raw_notes_{timestamp}.md')
+            content = f"# Raw Research Notes - {timestamp}\n\n" + '\n\n---\n\n'.join(raw_notes)
+            await asyncio.to_thread(write_file, raw_notes_path, content)
+            print(f"Raw notes saved to: {raw_notes_path}")
     
     findings = "\n".join(notes)
     max_retries = 3
@@ -565,10 +653,15 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
         )
         try:
             final_report = await configurable_model.with_config(writer_model_config).ainvoke([HumanMessage(content=final_report_prompt)])
+            
+            # Save notes AFTER successful report generation (prevents duplicates on retry)
+            try:
+                await save_notes_async()
+            except Exception as e:
+                print(f"Warning: Failed to save notes to /docs: {e}")
+            
             return {
-                "final_report": final_report.content, 
-                "messages": [final_report],
-                **cleared_state
+                "final_report": final_report.content
             }
         except Exception as e:
             if is_token_limit_exceeded(e, configurable.final_report_model):
@@ -576,8 +669,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                     model_token_limit = get_model_token_limit(configurable.final_report_model)
                     if not model_token_limit:
                         return {
-                            "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}",
-                            **cleared_state
+                            "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}"
                         }
                     findings_token_limit = model_token_limit * 4
                 else:
@@ -588,14 +680,274 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
             else:
                 # If not a token limit exceeded error, then we just throw an error.
                 return {
-                    "final_report": f"Error generating final report: {e}",
-                    **cleared_state
+                    "final_report": f"Error generating final report: {e}"
                 }
     return {
-        "final_report": "Error generating final report: Maximum retries exceeded",
-        "messages": [final_report],
-        **cleared_state
+        "final_report": "Error generating final report: Maximum retries exceeded"
     }
+
+
+##########################
+# Post-Processing Subgraph
+# Handles citation check, URL conversion, and PDF generation
+# with isolated message state (doesn't receive parent's messages)
+##########################
+
+async def pp_check_citations(state: PostProcessingState, config: RunnableConfig):
+    """Verify that all <ref> citations match research notes exactly.
+    
+    Uses citation_think_tool to analyze each citation and correct any
+    paraphrased or hallucinated source sentences.
+    
+    Args:
+        state: Post-processing state with isolated messages
+        config: Runtime configuration
+        
+    Returns:
+        Dictionary with corrected final_report
+    """
+    from langchain.agents import create_agent
+    from langchain.agents.middleware import ToolCallLimitMiddleware
+    
+    configurable = Configuration.from_runnable_config(config)
+    
+    # Build model config for citation check
+    citation_model_config = build_model_config(
+        configurable.citation_check_model,
+        configurable.citation_check_model_max_tokens,
+        config
+    )
+    
+    final_report = state.get("final_report", "")
+    notes = state.get("notes", [])
+    
+    # If no report or no notes, skip checking
+    if not final_report or not notes:
+        print("Citation check: Skipping - no report or notes available")
+        return {"final_report": final_report}
+    
+    # Combine notes for context
+    notes_combined = "\n\n---\n\n".join(notes)
+    
+    # Format the prompt
+    check_prompt = citation_check_prompt.format(
+        notes=notes_combined,
+        report=final_report
+    )
+    
+    try:
+        # Create agent with citation_think_tool and run limit middleware
+        citation_agent = create_agent(
+            model=configurable_model.with_config(citation_model_config),
+            tools=[citation_think_tool],
+            system_prompt=check_prompt,
+            middleware=[
+                ToolCallLimitMiddleware(run_limit=configurable.citation_check_tool_call_limit)
+            ]
+        )
+        
+        # Run the citation check agent with fresh messages (isolated from parent)
+        result = await citation_agent.ainvoke({
+            "messages": [HumanMessage(content="Please verify and correct all citations in the report.")]
+        })
+        
+        # Extract the corrected report from the last AI message
+        for msg in reversed(result.get("messages", [])):
+            if isinstance(msg, AIMessage) and msg.content:
+                corrected_report = msg.content
+                print("Citation check completed successfully")
+                return {"final_report": corrected_report}
+        
+        # If no corrected report found, return original
+        print("Citation check: No corrections made")
+        return {"final_report": final_report}
+        
+    except Exception as e:
+        print(f"Citation check failed: {e}")
+        return {"final_report": final_report}
+
+
+async def pp_convert_refs_to_urls(state: PostProcessingState, config: RunnableConfig):
+    """Convert <ref> tags to text-fragment URLs for PDF generation.
+    
+    Uses an LLM to convert <ref id="N">"source sentence"</ref> tags
+    to markdown links with text-fragment URLs in range format.
+    
+    Args:
+        state: Post-processing state containing final_report
+        config: Runtime configuration
+        
+    Returns:
+        Dictionary with final_report_pdf containing URL-converted content string
+    """
+    configurable = Configuration.from_runnable_config(config)
+    
+    # Build model config for PDF conversion
+    conversion_model_config = build_model_config(
+        configurable.pdf_conversion_model,
+        configurable.pdf_conversion_model_max_tokens,
+        config
+    )
+    
+    final_report = state.get("final_report", "")
+    
+    if not final_report:
+        return {"final_report_pdf": ""}
+    
+    # Format the conversion prompt
+    conversion_prompt = convert_refs_to_urls_prompt.format(report=final_report)
+    
+    try:
+        # Invoke the model with fresh message (isolated from parent)
+        result = await configurable_model.with_config(conversion_model_config).ainvoke([
+            HumanMessage(content=conversion_prompt)
+        ])
+        
+        converted_report = result.content if result.content else final_report
+        print("Ref to URL conversion completed successfully")
+        return {"final_report_pdf": converted_report}
+        
+    except Exception as e:
+        print(f"Ref to URL conversion failed: {e}")
+        # On error, use original report (refs won't be clickable but content preserved)
+        return {"final_report_pdf": final_report}
+
+
+async def pp_convert_to_pdf(state: PostProcessingState, config: RunnableConfig):
+    """Convert the final report from markdown to PDF and save markdown.
+    
+    Uses WeasyPrint to convert markdown → HTML → PDF with professional styling.
+    - Saves markdown file with citation-corrected content (final_report with <ref> tags)
+    - Generates PDF from final_report_pdf (with text-fragment URLs for clickable links)
+    
+    Args:
+        state: Post-processing state containing final_report and final_report_pdf
+        config: Runtime configuration
+        
+    Returns:
+        Dictionary with pdf_path and md_path
+    """
+    final_report = state.get("final_report", "")
+    # Use URL-converted version for PDF, fall back to original
+    pdf_ready_content = state.get("final_report_pdf", "") or final_report
+    
+    if not final_report:
+        return {
+            "pdf_path": None,
+            "md_path": None
+        }
+    
+    # Extract and sanitize title for filename
+    title = extract_title_from_markdown(final_report)
+    sanitized_title = sanitize_filename(title)
+    
+    # Setup paths
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    docs_dir = os.path.join(os.path.dirname(__file__), '../../docs')
+    
+    # Ensure docs directory exists
+    try:
+        await asyncio.to_thread(os.makedirs, docs_dir, exist_ok=True)
+    except Exception as e:
+        print(f"Warning: Failed to create docs directory: {e}")
+        return {
+            "pdf_path": None,
+            "md_path": None
+        }
+    
+    pdf_path = os.path.join(docs_dir, f"{sanitized_title}_{timestamp}.pdf")
+    md_path = os.path.join(docs_dir, f"{sanitized_title}_{timestamp}.md")
+    
+    # Save markdown version with citation-corrected content (final_report with <ref> tags)
+    # This preserves the readable format before URL conversion
+    md_success = await save_markdown_file(final_report, md_path)
+    if md_success:
+        print(f"Markdown saved to: {md_path}")
+    else:
+        print(f"Warning: Failed to save markdown file")
+    
+    # Generate PDF from URL-converted content (with text-fragment links)
+    pdf_success = await generate_pdf_from_markdown(pdf_ready_content, pdf_path, title)
+    
+    if pdf_success:
+        print(f"PDF generated successfully: {pdf_path}")
+        return {
+            "pdf_path": pdf_path,
+            "md_path": md_path
+        }
+    
+    # PDF generation failed - markdown already saved above
+    if md_success:
+        print(f"PDF generation failed, markdown available at: {md_path}")
+        return {
+            "pdf_path": None,
+            "md_path": md_path
+        }
+    
+    return {
+        "pdf_path": None,
+        "md_path": None
+    }
+
+
+# Build the post-processing subgraph with isolated state
+post_processing_builder = StateGraph(
+    PostProcessingState, 
+    input=PostProcessingInputState,
+    output=PostProcessingOutputState,
+    config_schema=Configuration
+)
+post_processing_builder.add_node("check_citations", pp_check_citations)
+post_processing_builder.add_node("convert_refs_to_urls", pp_convert_refs_to_urls)
+post_processing_builder.add_node("convert_to_pdf", pp_convert_to_pdf)
+post_processing_builder.add_edge(START, "check_citations")
+post_processing_builder.add_edge("check_citations", "convert_refs_to_urls")
+post_processing_builder.add_edge("convert_refs_to_urls", "convert_to_pdf")
+post_processing_builder.add_edge("convert_to_pdf", END)
+post_processing_subgraph = post_processing_builder.compile()
+
+
+async def post_process_report(state: AgentState, config: RunnableConfig):
+    """Wrapper node that invokes the post-processing subgraph.
+    
+    Transforms parent state to subgraph input, invokes subgraph,
+    and transforms results back to parent state.
+    
+    This achieves message isolation - the subgraph has its own
+    message state and doesn't receive the parent's messages.
+    
+    Args:
+        state: Parent AgentState
+        config: Runtime configuration
+        
+    Returns:
+        Dictionary with updated final_report, final_report_pdf, pdf_path, md_path, and messages
+    """
+    # Transform parent state to subgraph input
+    subgraph_input = {
+        "final_report": state.get("final_report", ""),
+        "notes": state.get("notes", [])
+    }
+    
+    # Invoke the subgraph with isolated state
+    subgraph_output = await post_processing_subgraph.ainvoke(subgraph_input, config)
+    
+    final_report = subgraph_output.get("final_report", state.get("final_report", ""))
+    final_message = AIMessage(content=final_report)
+    
+    return {
+        "final_report": final_report,
+        "final_report_pdf": subgraph_output.get("final_report_pdf", ""),
+        "pdf_path": subgraph_output.get("pdf_path"),
+        "md_path": subgraph_output.get("md_path"),
+        "messages": [final_message],
+        "notes": {"type": "override", "value": []}
+    }
+
+
+##########################
+# Main Graph
+##########################
 
 deep_researcher_builder = StateGraph(AgentState, input=AgentInputState, config_schema=Configuration)
 deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)
@@ -604,8 +956,12 @@ deep_researcher_builder.add_node("approve_research_brief", approve_research_brie
 deep_researcher_builder.add_node("write_draft_report", write_draft_report)
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)
+# Post-processing subgraph handles: citation check → URL conversion → PDF generation
+# with isolated message state (doesn't receive parent's messages)
+deep_researcher_builder.add_node("post_process_report", post_process_report)
 deep_researcher_builder.add_edge(START, "clarify_with_user")
 deep_researcher_builder.add_edge("research_supervisor", "final_report_generation")
-deep_researcher_builder.add_edge("final_report_generation", END)
+deep_researcher_builder.add_edge("final_report_generation", "post_process_report")
+deep_researcher_builder.add_edge("post_process_report", END)
 
 graph = deep_researcher_builder.compile(name = "deep_researcher")

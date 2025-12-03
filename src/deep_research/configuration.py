@@ -42,7 +42,7 @@ class Configuration(BaseModel):
         }
     )
     allow_clarification: bool = Field(
-        default=True,
+        default=False,
         metadata={
             "x_oap_ui_config": {
                 "type": "boolean",
@@ -104,11 +104,11 @@ class Configuration(BaseModel):
         }
     )
     max_researcher_iterations: int = Field(
-        default=3,
+        default=6,
         metadata={
             "x_oap_ui_config": {
                 "type": "slider",
-                "default": 3,
+                "default": 10,
                 "min": 1,
                 "max": 10,
                 "step": 1,
@@ -117,7 +117,7 @@ class Configuration(BaseModel):
         }
     )
     max_react_tool_calls: int = Field(
-        default=5,
+        default=4,
         metadata={
             "x_oap_ui_config": {
                 "type": "slider",
@@ -130,7 +130,7 @@ class Configuration(BaseModel):
         }
     )
     enable_search_for_brief: bool = Field(
-        default=True,
+        default=False,
         metadata={
             "x_oap_ui_config": {
                 "type": "boolean",
@@ -214,7 +214,7 @@ class Configuration(BaseModel):
     
     # Model Configuration
     summarization_model: str = Field(
-        default="azure_openai:gpt-5",
+        default="azure_openai:o4-mini",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
@@ -293,6 +293,62 @@ class Configuration(BaseModel):
             }
         }
     )
+    
+    # Citation Check Configuration
+    citation_check_model: str = Field(
+        default="azure_openai:gpt-5",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "azure_openai:o4-mini",
+                "description": "Model for verifying citations match source text exactly"
+            }
+        }
+    )
+    citation_check_model_max_tokens: int = Field(
+        default=16000,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 16000,
+                "description": "Maximum output tokens for citation check model"
+            }
+        }
+    )
+    citation_check_tool_call_limit: int = Field(
+        default=20,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 20,
+                "min": 5,
+                "max": 50,
+                "description": "Maximum number of tool calls allowed for citation check agent per run"
+            }
+        }
+    )
+    
+    # PDF Conversion Configuration
+    pdf_conversion_model: str = Field(
+        default="azure_openai:gpt-5",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "azure_openai:o4-mini",
+                "description": "Model for converting ref tags to text-fragment URLs for PDF"
+            }
+        }
+    )
+    pdf_conversion_model_max_tokens: int = Field(
+        default=16000,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 16000,
+                "description": "Maximum output tokens for PDF conversion model"
+            }
+        }
+    )
 
     # MCP server configuration for the deep research agent
     # see load_mcp_tools in utils.py for more details
@@ -313,6 +369,52 @@ class Configuration(BaseModel):
             "x_oap_ui_config": {
                 "type": "text",
                 "description": "Any additional instructions to pass along to the Agent regarding the MCP tools that are available to it."
+            }
+        }
+    )
+
+    # Context Summarization Configuration
+    enable_context_summarization: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Whether to enable automatic context summarization when approaching token limits"
+            }
+        }
+    )
+    max_tokens_before_summary: int = Field(
+        default=100000,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 100000,
+                "min": 10000,
+                "max": 200000,
+                "description": "Token threshold to trigger context summarization. When messages exceed this limit, older messages will be summarized."
+            }
+        }
+    )
+    messages_to_keep: int = Field(
+        default=20,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 20,
+                "min": 5,
+                "max": 50,
+                "description": "Number of recent messages to preserve after summarization"
+            }
+        }
+    )
+    context_summarization_model: str = Field(
+        default="azure_openai:o4-mini",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "azure_openai:o4-mini",
+                "description": "Model to use for context summarization (o4-mini recommended for speed)"
             }
         }
     )
