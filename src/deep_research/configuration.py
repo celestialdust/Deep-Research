@@ -65,7 +65,7 @@ class Configuration(BaseModel):
         }
     )
     enable_human_in_the_loop: bool = Field(
-        default=False,
+        default=True,
         metadata={
             "x_oap_ui_config": {
                 "type": "boolean",
@@ -104,7 +104,7 @@ class Configuration(BaseModel):
         }
     )
     max_researcher_iterations: int = Field(
-        default=7,
+        default=6,
         metadata={
             "x_oap_ui_config": {
                 "type": "slider",
