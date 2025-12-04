@@ -42,7 +42,7 @@ class Configuration(BaseModel):
         }
     )
     allow_clarification: bool = Field(
-        default=False,
+        default=True,
         metadata={
             "x_oap_ui_config": {
                 "type": "boolean",
@@ -130,7 +130,7 @@ class Configuration(BaseModel):
         }
     )
     enable_search_for_brief: bool = Field(
-        default=False,
+        default=True,
         metadata={
             "x_oap_ui_config": {
                 "type": "boolean",

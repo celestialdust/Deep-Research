@@ -5,7 +5,7 @@
 1. Clone the repository and activate a virtual environment:
 ```bash
 git clone <the repo url>
-cd open_deep_research
+cd deep_research_openai
 uv venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 ```
@@ -42,7 +42,7 @@ Deep Research offers extensive configuration options to customize the research p
 #### General Settings
 
 - **Max Structured Output Retries** (default: 3): Maximum number of retries for structured output calls from models when parsing fails
-- **Allow Clarification** (default: true): Whether to allow the researcher to ask clarifying questions before starting research
+- **Allow Clarification** (default: false): Whether to allow the researcher to ask clarifying questions before starting research
 - **Max Concurrent Research Units** (default: 5): Maximum number of research units to run concurrently using sub-agents. Higher values enable faster research but may hit rate limits
 - **Enable Human-in-the-Loop** (default: true): Whether to enable human approval for the research brief before proceeding to draft report generation
 - **Max Brief Refinement Rounds** (default: 1): Maximum number of times the research brief can be refined based on human feedback before proceeding automatically
@@ -50,9 +50,9 @@ Deep Research offers extensive configuration options to customize the research p
 #### Research Configuration
 
 - **Search API** (default: Tavily): Choose from Tavily (works with all models), OpenAI Native Web Search, Anthropic Native Web Search, or None
-- **Max Researcher Iterations** (default: 3): Number of times the Research Supervisor will reflect on research and ask follow-up questions
-- **Max React Tool Calls** (default: 5): Maximum number of tool calling iterations in a single researcher step
-- **Enable Search for Brief** (default: true): Whether to enable Tavily search for the research brief generation node (max 1 search allowed)
+- **Max Researcher Iterations** (default: 6): Number of times the Research Supervisor will reflect on research and ask follow-up questions
+- **Max React Tool Calls** (default: 4): Maximum number of tool calling iterations in a single researcher step
+- **Enable Search for Brief** (default: false): Whether to enable Tavily search for the research brief generation node (max 1 search allowed)
 - **Enable Search for Draft** (default: true): Whether to enable Tavily search for the draft report generation node (max 1 search allowed)
 
 #### Model Configuration
@@ -63,13 +63,18 @@ Deep Research offers extensive configuration options to customize the research p
   - API Version: `2025-04-01-preview`
   - Token limit: 200,000 tokens
 - **Model Selection**: Configure different models for summarization, research, compression, final report generation, citation checking, and PDF conversion
+  - `summarization_model` (default: azure_openai:o4-mini): For summarizing search results
+  - `research_model` (default: azure_openai:gpt-5): For conducting research
+  - `compression_model` (default: azure_openai:o4-mini): For compressing research findings
+  - `final_report_model` (default: azure_openai:gpt-5): For generating final reports
 - **Azure OpenAI Settings**: Customize endpoint, API version, and deployment names for each model
 
 #### Citation & PDF Configuration
 
-- **Citation Check Model** (default: azure_openai:o4-mini): Model for verifying citations match source text exactly
+- **Citation Check Model** (default: azure_openai:gpt-5): Model for verifying citations match source text exactly
 - **Citation Check Model Max Tokens** (default: 16,000): Maximum output tokens for citation check model
-- **PDF Conversion Model** (default: azure_openai:o4-mini): Model for converting `<ref>` tags to text-fragment URLs
+- **Citation Check Tool Call Limit** (default: 20): Maximum number of tool calls for citation check agent per run
+- **PDF Conversion Model** (default: azure_openai:gpt-5): Model for converting `<ref>` tags to text-fragment URLs
 - **PDF Conversion Model Max Tokens** (default: 16,000): Maximum output tokens for PDF conversion model
 
 #### Context Engineering Configuration
@@ -83,17 +88,19 @@ Deep Research offers extensive configuration options to customize the research p
 
 Deep Research Agent uses a sophisticated multi-agent architecture built on LangGraph with the following components:
 
-- **User Clarification**: Optionally asks clarifying questions before starting research
-- **Research Brief Generator**: Creates a detailed research brief from user messages, with optional Tavily search for up-to-date context
-- **Human-in-the-Loop Approval**: Allows human review and refinement of the research brief before proceeding (optional, configurable)
-- **Draft Report Generator**: Creates an initial draft report from the research brief that serves as a baseline for iterative refinement, with optional Tavily search for preliminary context
-- **Research Supervisor**: Orchestrates the research process using a diffusion algorithm, breaks down complex queries, and manages parallel research units with strategic reflection via `think_tool`
-- **Research Agents**: Conduct focused research on specific topics using available tools and search APIs
-- **Compression Agent**: Synthesizes and compresses research findings from multiple agents
-- **Draft Report Refiner**: Iteratively refines the draft report based on new research findings using the diffusion algorithm
-- **Report Generator**: Creates comprehensive final reports from all research findings with enhanced insightfulness and helpfulness criteria
-- **Citation Check Agent**: Verifies that all `<ref>` citations match research notes exactly, correcting paraphrased or hallucinated source sentences
-- **URL Conversion Agent**: Converts `<ref id="N">"source"</ref>` tags to text-fragment URLs using range matching for PDF generation
+- **User Clarification** (`clarify_with_user`): Optionally asks clarifying questions before starting research
+- **Research Brief Generator** (`write_research_brief`): Creates a detailed research brief from user messages, with optional Tavily search for up-to-date context
+- **Human-in-the-Loop Approval** (`approve_research_brief`): Allows human review and refinement of the research brief before proceeding (uses LangGraph interrupt pattern)
+- **Draft Report Generator** (`write_draft_report`): Creates an initial draft report from the research brief that serves as a baseline for iterative refinement, with optional Tavily search for preliminary context
+- **Research Supervisor** (`supervisor_subgraph`): Orchestrates the research process using a diffusion algorithm, breaks down complex queries, and manages parallel research units with strategic reflection via `think_tool`
+- **Research Agents** (`researcher_subgraph`): Conduct focused research on specific topics using available tools and search APIs
+- **Compression Agent** (`compress_research`): Synthesizes and compresses research findings from multiple agents while preserving exact source sentences
+- **Draft Report Refiner** (`refine_draft_report` tool): Iteratively refines the draft report based on new research findings using the diffusion algorithm
+- **Report Generator** (`final_report_generation`): Creates comprehensive final reports from all research findings with enhanced insightfulness and helpfulness criteria
+- **Post-Processing Pipeline** (`post_process_report` wrapper → `post_processing_subgraph`):
+  - **Citation Check Agent** (`pp_check_citations`): Verifies that all `<ref>` citations match research notes exactly using `create_agent` with `citation_think_tool`
+  - **URL Conversion Agent** (`pp_convert_refs_to_urls`): LLM converts `<ref id="N">"source"</ref>` tags to text-fragment URLs using range matching
+  - **PDF Generator** (`pp_convert_to_pdf`): Converts markdown to PDF with WeasyPrint
 
 ### Key Features
 
@@ -152,65 +159,69 @@ deep_research_openai/
   - Azure OpenAI settings with separate deployment configurations
   - Supports both environment variables and UI configuration
 
-- **`deep_researcher.py`**: Contains the main LangGraph workflow implementation with nodes for:
-  - User clarification
-  - Research brief generation (with optional Tavily search)
-  - Human-in-the-loop research brief approval
-  - Draft report generation (with optional Tavily search and `<ref>` citations)
-  - Research supervisor (with diffusion algorithm and context summarization)
-  - Parallel research execution (with context summarization)
-  - Research compression (with exact source sentence preservation)
-  - Draft report refinement
-  - Final report generation (with `<ref>` inline citations and async note-saving to `/docs`)
-  - Citation check (verifies citations match research notes exactly using `create_agent`)
-  - URL conversion (converts `<ref>` tags to text-fragment URLs for PDF)
-  - PDF conversion (markdown → HTML → PDF with WeasyPrint)
+- **`deep_researcher.py`**: Contains the main LangGraph workflow implementation with:
+  - **Main Graph Nodes**:
+    - `clarify_with_user`: Optional user clarification before research
+    - `write_research_brief`: Research brief generation (with optional Tavily search)
+    - `approve_research_brief`: Human-in-the-loop research brief approval (interrupt-based)
+    - `write_draft_report`: Draft report generation (with optional Tavily search and `<ref>` citations)
+    - `research_supervisor`: Invokes the supervisor subgraph (with diffusion algorithm)
+    - `final_report_generation`: Final report with `<ref>` inline citations and async note-saving to `/docs`
+    - `post_process_report`: Wrapper node invoking post-processing subgraph with isolated state
+  - **Supervisor Subgraph** (`supervisor_subgraph`):
+    - `supervisor`: Research planning with think_tool and ConductResearch
+    - `supervisor_tools`: Executes research via researcher subgraph, handles refine_draft_report
+  - **Researcher Subgraph** (`researcher_subgraph`):
+    - `researcher`: Conducts focused research with search tools
+    - `researcher_tools`: Executes tool calls
+    - `compress_research`: Compresses findings with exact source sentence preservation
+  - **Post-Processing Subgraph** (`post_processing_subgraph`):
+    - `check_citations`: Verifies citations match research notes exactly using `create_agent` with `citation_think_tool`
+    - `convert_refs_to_urls`: LLM converts `<ref>` tags to text-fragment URLs for PDF
+    - `convert_to_pdf`: Markdown → HTML → PDF with WeasyPrint
 
 - **`state.py`**: Defines all state classes and data models:
-  - `AgentState`: Main workflow state (includes `draft_report`, `brief_refinement_rounds`, `pdf_path`, `final_report_pdf` fields)
-  - `SupervisorState`: Research supervisor state (includes `draft_report` field)
-  - `ResearcherState`: Individual researcher state
-  - `ClaimSourcePair`: Atomic claim with exact source sentence for text-fragment citations (claim + source_sentence fields)
-  - `Summary`: Structured webpage summary with claim-source pairs where every key claim is backed by a source sentence
-  - `DraftReport`: Structured output for draft report generation
-  - Structured outputs for research coordination
+  - `AgentState`: Main workflow state (includes `draft_report`, `brief_refinement_rounds`, `pdf_path`, `md_path`, `final_report_pdf` fields)
+  - `AgentInputState`: Input state for the main graph (messages only)
+  - `SupervisorState`: Research supervisor state (includes `draft_report`, `research_iterations` fields)
+  - `ResearcherState`: Individual researcher state (includes `tool_call_iterations`, `research_topic` fields)
+  - `ResearcherOutputState`: Output state for researcher subgraph
+  - `PostProcessingState`: State for post-processing subgraph with isolated messages
+  - `PostProcessingInputState`: Input state for post-processing (final_report, notes)
+  - `PostProcessingOutputState`: Output state for post-processing (final_report, final_report_pdf, pdf_path, md_path)
+  - `ClaimSourcePair`: Atomic claim with exact source sentence for text-fragment citations
+  - `Summary`: Structured webpage summary with claim-source pairs
+  - `ClarifyWithUser`, `ResearchQuestion`, `DraftReport`: Structured outputs for research coordination
+  - `ConductResearch`, `ResearchComplete`: Tool schema classes for supervisor
 
 - **`utils.py`**: Utility functions including:
   - `MessageSummarizer`: Context window summarization class (mirrors LangChain v1's `SummarizationMiddleware`)
+  - `invoke_model_with_summarization`: Wrapper for model invocation with automatic context summarization
   - `think_tool`: Strategic reflection tool for research planning
   - `citation_think_tool`: Analysis tool for verifying citation accuracy against research notes
   - `refine_draft_report`: Tool for iteratively refining the draft report
   - `tavily_search`: Tavily search tool for research brief and draft generation
   - `summarize_webpage`: Webpage summarization with atomic claim-source pair extraction (with automatic retry on token limits)
-  - PDF generation utilities: `generate_pdf_from_markdown`, `save_markdown_file`, `extract_title_from_markdown`, `sanitize_filename`
-  - `PDF_CSS_STYLES`: Professional CSS styling for PDF reports
-  - URL utilities with robust fallback handling:
-    - `create_citation_link`: One-step citation link from URL + source sentence
-    - `create_text_fragment_url`: Create range-matched text fragment URLs
-    - `validate_url`: Validate and sanitize URLs with automatic https:// prefix
-    - `normalize_url`: Clean up common URL issues (double slashes, trailing hashes)
-    - `extract_text_fragment`: Parse text fragment components from URLs
-    - `sanitize_anchor_text`: Clean anchor text, remove problematic chars
-    - `get_anchor_from_sentence`: Extract optimal start/end anchors with capital-letter detection
-    - `encode_text_fragment_anchor` / `decode_text_fragment_anchor`: URL encoding/decoding
-    - `has_problematic_chars`: Check for characters that break URLs/PDFs
-  - MCP tool loading and authentication
-  - Search API integration (Tavily, OpenAI, Anthropic)
-  - Model configuration builders with GPT-5 support
-  - Token limit management with extended model coverage
+  - PDF generation utilities: `generate_pdf_from_markdown`, `save_markdown_file`, `extract_title_from_markdown`, `sanitize_filename`, `convert_citations_to_superscript`
+  - `PDF_CSS_STYLES`: Professional CSS styling for PDF reports (OpenAI-style circular citation badges)
+  - MCP tool loading and authentication (`load_mcp_tools`, `fetch_tokens`, `get_mcp_access_token`)
+  - Search API integration (Tavily, OpenAI, Anthropic) via `get_search_tool`, `get_all_tools`
+  - Model configuration builders (`build_model_config`) with GPT-5 and Azure OpenAI support
+  - Token limit management (`is_token_limit_exceeded`, `get_model_token_limit`, `MODEL_TOKEN_LIMITS`)
 
 - **`prompts.py`**: System prompts and templates for:
-  - Research clarification
-  - Research brief generation (with optional search tool instructions)
-  - Research planning with diffusion algorithm
-  - Draft report generation (with `<ref id="N">"source"</ref>` citation format)
-  - Research execution with strategic reflection
-  - Webpage summarization with atomic claim-source pair extraction (every key claim must be backed by a source sentence)
-  - Content summarization and compression (with exact source sentence preservation)
-  - Draft report refinement
-  - Final report generation (with `<ref>` inline citations and Sources section rules)
-  - Citation verification (for checking citations against research notes)
-  - URL conversion (for converting refs to text-fragment URLs)
+  - `clarify_with_user_instructions`: Research clarification prompt
+  - `transform_messages_into_research_topic_prompt`: Research brief generation (with optional search tool instructions)
+  - `lead_researcher_prompt`: Research planning with diffusion algorithm (ConductResearch, refine_draft_report, ResearchComplete tools)
+  - `draft_report_generation_prompt`: Draft report generation (with `<ref id="N">"source"</ref>` citation format)
+  - `research_system_prompt`: Research execution with strategic reflection (think_tool, tavily_search)
+  - `summarize_webpage_prompt`: Webpage summarization with atomic claim-source pair extraction (5-10 selective pairs)
+  - `compress_research_system_prompt` / `compress_research_simple_human_message`: Content compression with exact source sentence preservation
+  - `report_generation_with_draft_insight_prompt`: Draft report refinement
+  - `final_report_generation_prompt`: Final report generation (with `<ref>` inline citations and Sources section rules)
+  - `context_summarization_prompt`: Context window summarization for MessageSummarizer
+  - `citation_check_prompt`: Citation verification (for checking citations against research notes)
+  - `convert_refs_to_urls_prompt`: URL conversion (for converting refs to text-fragment URLs with range matching)
 
 #### `src/security/`
 
@@ -278,9 +289,12 @@ The `MessageSummarizer` class provides automatic context window management by su
 - **Token-based triggering**: Summarization triggers when message tokens exceed `max_tokens_before_summary`
 - **Safe cutoff detection**: Preserves AI/Tool message pairs to avoid breaking tool call chains
 - **Configurable token counter**: Defaults to `count_tokens_approximately`, can be customized
-- **Both sync and async support**: `summarize_if_needed()` (async) and `summarize_if_needed_sync()` (sync)
+- **Async support**: `before_model()` method processes messages before model invocation
 
-**Applied to nodes:**
+**Helper Function:**
+The `invoke_model_with_summarization()` function wraps model invocation with automatic context summarization, making it easy to integrate into any node.
+
+**Applied to nodes via `invoke_model_with_summarization`:**
 - `supervisor` - Summarizes `supervisor_messages`
 - `researcher` - Summarizes `researcher_messages`  
 - `compress_research` - Summarizes `researcher_messages`
@@ -305,7 +319,7 @@ Deep Research generates citations with text-fragment links that navigate directl
    - `claim`: A key factual claim from the summary (headline-worthy facts)
    - `source_sentence`: The exact verbatim sentence from the source
    
-   **Selective Extraction**: Only 3-7 most citation-worthy claims get source sentences (headline facts, primary findings, unique insights). The summary remains comprehensive while claim-source pairs focus on the most important facts likely to be cited in final reports.
+   **Selective Extraction**: Only 5-10 most citation-worthy claims get source sentences (headline facts, primary findings, unique insights). The summary remains comprehensive while claim-source pairs focus on the most important facts likely to be cited in final reports.
    
    The summarization includes robust error handling:
    - Automatic content truncation to stay within token limits (default 30,000 chars)
@@ -382,64 +396,24 @@ Targeted therapies changed treatment [1](https://example.com/article#:~:text=Tar
 - Brackets (would encode to `%5B` `%5D`)
 - Percent signs (would encode to `%25`)
 
-### URL Utilities
+### URL Conversion Process
 
-The `utils.py` module provides robust URL handling with comprehensive fallback:
+Text-fragment URL conversion is handled by the LLM-based URL conversion agent (`convert_refs_to_urls` node) using structured prompts. The conversion follows the WICG Scroll-to-Text Fragment spec:
 
-```python
-from deep_research.utils import (
-    create_text_fragment_url,    # Create range-matched text fragment URLs
-    create_citation_link,        # One-step citation link from URL + sentence
-    validate_url,                # Validate and sanitize URLs
-    normalize_url,               # Clean up common URL issues
-    extract_text_fragment,       # Parse text fragment from URL
-    sanitize_anchor_text,        # Clean anchor text for URL encoding
-    get_anchor_from_sentence,    # Extract start/end anchors from sentence
-    encode_text_fragment_anchor, # Encode text for URL fragment
-    decode_text_fragment_anchor, # Decode URL fragment to text
-    has_problematic_chars        # Check for chars that break URLs/PDFs
-)
-
-# Create a citation link from URL and source sentence (recommended)
-url = create_citation_link(
-    base_url="https://example.com/article",
-    source_sentence="Targeted therapies have reshaped the management of relapsed CLL."
-)
-# Returns: https://example.com/article#:~:text=Targeted%20therapies%20have%20reshaped,management%20of%20relapsed%20CLL
-
-# Or manually create with specific anchors
-url = create_text_fragment_url(
-    base_url="https://example.com/article",
-    start_anchor="Targeted therapies have reshaped",
-    end_anchor="management of relapsed CLL"
-)
-
-# Validate and normalize URLs
-is_valid, result = validate_url("example.com/page")
-# is_valid: True, result: "https://example.com/page"
-
-# Extract anchors from a sentence
-start = get_anchor_from_sentence("The study enrolled 1847 participants.", position="start")
-end = get_anchor_from_sentence("The study enrolled 1847 participants.", position="end")
-# start: "The study enrolled 1847"
-# end: "enrolled 1847 participants"
+**Range Matching Format:**
+```
+#:~:text=START_ANCHOR,END_ANCHOR
 ```
 
-**Robustness Features:**
-- Automatic URL scheme detection and addition (`https://`)
-- URL normalization (removes double slashes, trailing hashes)
-- Anchor length limits (max 100 chars for PDF compatibility)
-- Automatic fallback to plain URL if fragment creation fails
-- Detection of problematic characters (commas, brackets, etc.)
-- Smart anchor extraction that finds capital-letter starts
-- Handles short sentences with fewer anchor words
+**Conversion Rules (applied by LLM):**
+- START: First 3-5 distinctive words (should begin with capital letter)
+- END: Last 3-5 words (should end with complete word, exclude period)
+- Encode spaces as `%20`
+- Total fragment should be under 100 characters
+- Avoid selecting text with commas, brackets, or special characters
 
-### Fallback Behavior
-
-If text-fragment generation fails, the system falls back to plain URLs:
-- Sentence has many special characters → plain URL
-- URL would exceed 100 characters → plain URL
-- Encoding error → plain URL
+**Fallback Behavior:**
+If text-fragment generation would fail (special characters, length limits), the LLM uses plain URLs without fragments.
 
 **Reference**: [WICG Scroll-to-Text Fragment Spec](https://wicg.github.io/scroll-to-text-fragment/)
 
@@ -489,33 +463,21 @@ The `AgentState` includes PDF-related fields:
 
 ### Workflow Integration
 
-The PDF generation pipeline runs after final report generation with citation verification:
+The PDF generation pipeline runs after final report generation with citation verification. The main graph uses a wrapper node to invoke a post-processing subgraph with isolated message state:
+
 ```
-final_report_generation → check_citations → convert_refs_to_urls → convert_to_pdf → END
+Main Graph:
+final_report_generation → post_process_report → END
+
+Post-Processing Subgraph (inside post_process_report):
+check_citations → convert_refs_to_urls → convert_to_pdf
 ```
 
 **Pipeline stages:**
-1. **final_report_generation**: Generates report with `<ref id="N">"source sentence"</ref>` inline citations
-2. **check_citations**: Verifies each ref's source sentence matches research notes exactly (uses `citation_think_tool`)
-3. **convert_refs_to_urls**: LLM converts `<ref>` tags to text-fragment URL links using range matching
-4. **convert_to_pdf**: Generates PDF from URL-converted markdown, adds report to UI messages
-
-## Future Developments
-
-### Engineering
-
-- Try different search apis and see which one works best
-- Reinforcement learning for better dynamic reasoning/planning + tool use
-- Web Search Resource validation agent
-- ~~Apply Context Engineering practices~~ (Completed)
-- ~~Retraceable Citations with Text-Fragment Links~~ (Completed)
-- ~~PDF Export for Professional Reports~~ (Completed)
-- ~~Citation Verification Agent~~ (Completed)
-- Integrate domain specific insights from feedbacks
-
-### Product/UX
-
-- Create a separate UI for deep research while putting it as a add-on in clinical trial protocol copilot
-- Send deep research reports as attachments to users in email after deep research is done
+1. **final_report_generation**: Generates report with `<ref id="N">"source sentence"</ref>` inline citations, saves notes to `/docs`
+2. **post_process_report**: Wrapper node that invokes the post-processing subgraph with isolated state
+   - **check_citations**: Verifies each ref's source sentence matches research notes exactly (uses `citation_think_tool` via `create_agent`)
+   - **convert_refs_to_urls**: LLM converts `<ref>` tags to text-fragment URL links using range matching
+   - **convert_to_pdf**: Generates PDF from URL-converted markdown, saves markdown file, adds report to UI messages
 
 
